@@ -33,8 +33,8 @@ All four use the same standard endpoints (`POST namespaces`, `POST tables`,
 `GET tables/{t}`). They differ only in URL prefix, auth, and the commit path.
 
 ### LakeCat
-LakeCat serves under `/catalog` and mounts commit at `.../tables/{t}/commit`
-(see the conformance note below), so pass `--commit-suffix /commit`:
+LakeCat serves under `/catalog` and is spec-conformant on both `createTable` and
+the bare commit path, so it uses the standard invocation:
 
 ```sh
 LAKECAT_BIND_ADDR=127.0.0.1:8181 LAKECAT_WAREHOUSE=local \
@@ -42,8 +42,7 @@ LAKECAT_BIND_ADDR=127.0.0.1:8181 LAKECAT_WAREHOUSE=local \
 
 catalog-commit-bench \
   --base-url http://127.0.0.1:8181/catalog \
-  --prefix local --create \
-  --commit-suffix /commit --idempotency \
+  --create --idempotency \
   --iterations 2000 --concurrency 8 --duration-secs 10
 ```
 
@@ -98,7 +97,10 @@ catalog-commit-bench \
 
 ## Conformance note (LakeCat)
 
-LakeCat mounts `updateTable` at `POST .../tables/{table}/commit`, whereas the
-Iceberg REST spec (and Polaris/Gravitino/Unity) use a bare
-`POST .../tables/{table}`. Hence `--commit-suffix /commit` for LakeCat only.
-A spec-conformant LakeCat should also accept the bare path.
+Building this benchmark surfaced two Iceberg REST conformance gaps in LakeCat,
+both since fixed: it only accepted `updateTable` at `.../tables/{table}/commit`
+(now also accepts the bare `POST .../tables/{table}`), and `createTable`
+required a client-supplied metadata document (now also accepts a standard schema
+and generates the metadata server-side). `--commit-suffix` therefore exists only
+for catalogs that might still mount commit on a sub-path; LakeCat no longer needs
+it.

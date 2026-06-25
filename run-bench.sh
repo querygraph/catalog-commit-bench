@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Run the commit benchmark against whichever catalogs are reachable.
 #
-# Table CREATION differs per catalog (LakeCat needs client-supplied
-# location+metadata; the others generate metadata server-side), so this script
-# provisions LakeCat explicitly and lets the bench's --create handle the rest.
-# Commit measurement is identical across all of them.
+# LakeCat is now spec-conformant on both createTable (schema -> server-generated
+# metadata) and the bare commit path, so every catalog uses the identical
+# `--create` + commit flow; no per-catalog provisioning or commit-suffix.
 set -uo pipefail
 
 BENCH="${BENCH:-./target/release/catalog-commit-bench}"
@@ -26,17 +25,10 @@ run_one() {
   echo
 }
 
-# --- LakeCat: provision the table in LakeCat's create shape, then commit -----
+# --- LakeCat (spec-conformant: standard --create + commit) -------------------
 LAKECAT_BASE="${LAKECAT_BASE:-http://127.0.0.1:8181/catalog}"
 if reachable "$LAKECAT_BASE/v1/config"; then
-  curl -fsS -X POST "$LAKECAT_BASE/v1/namespaces" \
-    -H 'content-type: application/json' \
-    -d "{\"namespace\":[\"$NS\"],\"properties\":{}}" >/dev/null 2>&1 || true
-  curl -fsS -X POST "$LAKECAT_BASE/v1/namespaces/$NS/tables" \
-    -H 'content-type: application/json' \
-    -d "{\"name\":\"$TABLE\",\"location\":\"file:///tmp/$NS/$TABLE\",\"metadata-location\":\"file:///tmp/$NS/$TABLE/metadata/00000.json\",\"metadata\":{\"format-version\":3,\"table-uuid\":\"11111111-1111-1111-1111-111111111111\",\"location\":\"file:///tmp/$NS/$TABLE\",\"last-sequence-number\":0,\"last-updated-ms\":1710000000000,\"last-column-id\":1,\"schemas\":[{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":false,\"type\":\"long\"}]}],\"current-schema-id\":0,\"partition-specs\":[{\"spec-id\":0,\"fields\":[]}],\"default-spec-id\":0,\"properties\":{},\"snapshots\":[],\"snapshot-log\":[],\"metadata-log\":[]}}" >/dev/null 2>&1 || true
-  # LakeCat is now spec-conformant on the bare commit path, so no --commit-suffix.
-  run_one "LakeCat" "$LAKECAT_BASE" --idempotency
+  run_one "LakeCat" "$LAKECAT_BASE" --create --idempotency
 else
   echo "skip LakeCat: $LAKECAT_BASE not reachable"
 fi

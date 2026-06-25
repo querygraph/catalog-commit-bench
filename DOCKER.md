@@ -37,9 +37,10 @@ cargo build --release
   --iterations 2000 --concurrency 8 --duration-secs 10 --idempotency
 ```
 
-LakeCat is now spec-conformant on the bare commit path, so no `--commit-suffix`
-is needed. Table creation still uses LakeCat's client-supplied-metadata shape;
-`run-bench.sh` provisions the table for you with the right body.
+LakeCat is now spec-conformant on both `createTable` (send a schema, the catalog
+generates the metadata) and the bare commit path, so it uses the same standard
+`--create` + commit flow as the other catalogs — no `--commit-suffix`, no
+special provisioning.
 
 ## The whole sweep
 
@@ -48,10 +49,9 @@ docker compose up -d lakecat
 ./run-bench.sh                     # benchmarks every reachable catalog
 ```
 
-`run-bench.sh` provisions LakeCat explicitly (its create-table shape differs),
-then runs the identical commit measurement against each catalog that is up. Set
-`POLARIS_TOKEN`, `UNITY_TOKEN`, and the `*_BASE`/`*_PREFIX` env vars to include
-the externals.
+`run-bench.sh` runs the identical `--create` + commit measurement against each
+catalog that is up. Set `POLARIS_TOKEN`, `UNITY_TOKEN`, and the
+`*_BASE`/`*_PREFIX` env vars to include the externals.
 
 ## Bootstrap caveats (the externals are not turnkey)
 
