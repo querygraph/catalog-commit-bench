@@ -65,6 +65,17 @@ a shared MinIO/S3 backend); LakeCat from this repo's image.
      LakeCat expects metadata to be authored by the client/engine, not built
      server-side from REST updates.
 
+  **Post-fix update.** With the Sail `TableUpdate` discriminator fix applied
+  (lakehq/sail#2134), a `set-properties` commit now returns 200 instead of
+  `missing field uuid` — the model bug is resolved. But it changes nothing about
+  the metadata write: LakeCat still writes **0** objects to MinIO, and the
+  committed table's `properties` stay `{}` (the update is not applied). Two gaps
+  remain, independent of the model fix: (a) `prepare_commit` never applies the
+  updates or materializes a new `metadata.json`; (b) under 8 concurrent writers
+  the Turso store fails with `database is locked` (single-writer is fine,
+  ~416 commits/s seq, p50 2.2 ms). So a fair, metadata-writing, concurrent
+  LakeCat number is still not achievable.
+
   Therefore LakeCat, as built, does not implement the "apply REST updates →
   new metadata.json → PUT to object store → advance pointer" commit semantics
   that Polaris/Nessie/Gravitino implement. Making it comparable is **feature
