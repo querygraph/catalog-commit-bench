@@ -48,15 +48,31 @@ a shared MinIO/S3 backend); LakeCat from this repo's image.
   - a real `set-properties` commit — the one that should write a new
     `metadata.json` — **fails**: Sail's engine rejects LakeCat's
     catalog-synthesized metadata with `missing field uuid`.
-  So a fair, metadata-writing LakeCat number is **not yet obtainable**. The
-  blocker is a real LakeCat↔Sail gap: the `createTable` conformance fix
-  synthesizes Iceberg metadata *in the catalog* (a minimal hand-rolled doc), and
-  the deferred path accepts it, but the real Sail engine cannot apply an update
-  to it. This validates LakeCat's own thesis — table-format metadata should be
-  built by the engine (Sail), not hand-rolled in the catalog. The correct fix is
-  to route initial-metadata creation through the `SailCatalogEngine` so create
-  and commit use the same engine-built metadata. Until then, LakeCat is not
-  measured on equal footing here.
+  So a fair, metadata-writing LakeCat number is **not obtainable without feature
+  work**. Root cause, pinned by reading the code (not the table metadata, as
+  first thought):
+  1. `lakecat-sail`'s `prepare_commit` validates the commit request against
+     Sail's generated `models::CommitTableRequest`, whose `updates` use
+     `models::TableUpdate` — a **degenerate flat struct with every field
+     required** (`uuid`, `format-version`, `schema`, …) rather than a tagged
+     union. So any real update fails: a `set-properties` commit reports
+     `missing field uuid`. (This is a bug in Sail's generated
+     `sail-catalog-iceberg` models; `BaseUpdate` is the correct tagged enum.)
+  2. More fundamentally, `prepare_commit` does
+     `new_metadata = request.new_metadata.unwrap_or(current_metadata)` — it
+     **never applies the `MetadataUpdate`s** to build new metadata, and only
+     writes an object when the *request* already carries `new_metadata_location`.
+     LakeCat expects metadata to be authored by the client/engine, not built
+     server-side from REST updates.
+
+  Therefore LakeCat, as built, does not implement the "apply REST updates →
+  new metadata.json → PUT to object store → advance pointer" commit semantics
+  that Polaris/Nessie/Gravitino implement. Making it comparable is **feature
+  work**, not a benchmark tweak: (a) fix/relax the commit-request validation to
+  the tagged `BaseUpdate`, and (b) apply `MetadataUpdate`s server-side (the
+  Sail-owned table-format step) and write the resulting metadata. Until that
+  exists, LakeCat's commit measures catalog-state CAS only and is not on equal
+  footing.
 - **Conflict models differ, and that dominates the concurrent column.** Nessie
   enforces strict serializable commits: 8 writers committing to the *same* table
   mostly conflict (80.6%) and would retry, so its successful-commit rate is
