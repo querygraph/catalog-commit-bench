@@ -134,7 +134,9 @@ impl Catalog {
                     {"id": 1, "name": "id", "required": false, "type": "long"}
                 ]
             },
-            "properties": {"bench.counter": "0"}
+            "properties": {"bench.counter": "0"},
+            // Optional in the spec, but Nessie requires it; harmless elsewhere.
+            "stage-create": false
         });
         let resp = self
             .req(self.http.post(self.tables_path(ns)))
