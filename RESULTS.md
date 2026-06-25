@@ -10,6 +10,7 @@ a shared MinIO/S3 backend); LakeCat from this repo's image.
 | **LakeCat** 0.1.1 | local file:// (Turso) | **303 /s** | 2.4 ms | 13.2 ms | **379 /s** | 0% |
 | **Gravitino** (iceberg-rest) | MinIO / S3 | 116 /s | 8.1 ms | 16.9 ms | 220 /s | 0% |
 | **Nessie** 0.107.5 | MinIO / S3 | 98 /s | 9.7 ms | 23.0 ms | 107 /s | **80.6%** |
+| **Polaris** 1.5.0 | MinIO / S3 | 57 /s | 16.6 ms | 34.7 ms | 57 /s | 11.8% |
 
 ## Reading the numbers honestly
 
@@ -27,7 +28,10 @@ a shared MinIO/S3 backend); LakeCat from this repo's image.
   Nessie's number reflects correctness strictness, not a slow path.
 - **Sequential throughput is the cleaner cross-catalog signal.** There,
   contention is removed and each number is per-commit catalog cost (plus the
-  storage caveat above): LakeCat 303 > Gravitino 116 > Nessie 98 /s.
+  storage caveat above): LakeCat 303 > Gravitino 116 > Nessie 98 > Polaris 57 /s.
+- **Polaris is the heaviest per commit** — it runs RBAC checks and credential
+  subscoping in addition to the S3 metadata write, which shows in its 16.6 ms
+  p50. That is governance cost, the same category of work LakeCat does inline.
 
 ## Reproduce
 
@@ -38,6 +42,9 @@ cd ~/src/boat && docker compose up -d minio nessie gravitino
 docker run --rm --network iceberg_lakehouse-net --entrypoint sh minio/mc -c \
   "mc alias set m http://minio:9000 admin password && mc mb -p m/warehouse"
 
+# polaris (from ~/src/boat) — needs a catalog bootstrap step
+cd ~/src/boat && docker compose up -d polaris && TOKEN=$(./polaris-bootstrap.sh | tail -1)
+
 # lakecat (from this repo)
 ./docker/build-lakecat.sh && docker compose build lakecat && docker compose up -d lakecat
 
@@ -46,10 +53,10 @@ P="--namespace bench --table commits --create --iterations 1000 --concurrency 8 
 ./target/release/catalog-commit-bench --base-url http://127.0.0.1:8181/catalog $P
 ./target/release/catalog-commit-bench --base-url http://127.0.0.1:19120/iceberg --prefix main $P
 ./target/release/catalog-commit-bench --base-url http://127.0.0.1:9002/iceberg $P
+./target/release/catalog-commit-bench --base-url http://127.0.0.1:8185/api/catalog --prefix bench --token "$TOKEN" $P
 ```
 
 ## Not measured
 
-- **Polaris / Unity** are not in `~/src/boat`'s compose. Polaris would slot in
-  with the same MinIO using its S3 storage config + OAuth2 bootstrap; Unity OSS
-  needs its external-`updateTable` write support confirmed first.
+- **Unity OSS** is not in `~/src/boat`'s compose; its external-`updateTable`
+  write support needs confirming before a write benchmark is meaningful.
