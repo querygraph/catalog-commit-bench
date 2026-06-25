@@ -1,3 +1,18 @@
+> ## ⚠️ Correction: the LakeCat row below is NOT comparable
+>
+> Verified empirically (MinIO object counts after a benchmark run): a standard
+> Iceberg commit writes a new `metadata.json` to object storage and advances the
+> pointer. Polaris, Nessie, and Gravitino each did this — thousands of S3 objects.
+> **LakeCat in the default/deferred build wrote ZERO objects** — its
+> `set-properties` commit only does the Turso pointer CAS + audit/outbox;
+> Iceberg metadata materialization is deferred to Sail, which is absent without
+> the `sail-local` feature. So LakeCat's numbers measure a *strictly lighter*
+> operation (catalog-state CAS, no metadata-file write) and must not be compared
+> head-to-head with the others. A fair LakeCat number requires building
+> `lakecat-service` with `--features turso-local,sail-local` so the real Sail
+> engine builds and writes a new `metadata.json` to S3 per commit. See "Storage
+> and the metadata-write asymmetry" below.
+
 # Commit-path results
 
 Same host, same driver, identical parameters: **1000 sequential commits**, then
@@ -7,18 +22,26 @@ a shared MinIO/S3 backend); LakeCat from this repo's image.
 
 | Catalog | Storage backend | Seq throughput | Seq p50 | Seq p99 | Concurrent (8w) | Conflict rate |
 |---|---|---|---|---|---|---|
-| **LakeCat** 0.1.1 | local file:// (Turso) | **303 /s** | 2.4 ms | 13.2 ms | **379 /s** | 0% |
+| **LakeCat** 0.1.1 ⚠️ | Turso CAS only, **no metadata write** | 303 /s | 2.4 ms | 13.2 ms | 379 /s | 0% |
 | **Gravitino** (iceberg-rest) | MinIO / S3 | 116 /s | 8.1 ms | 16.9 ms | 220 /s | 0% |
 | **Nessie** 0.107.5 | MinIO / S3 | 98 /s | 9.7 ms | 23.0 ms | 107 /s | **80.6%** |
 | **Polaris** 1.5.0 | MinIO / S3 | 57 /s | 16.6 ms | 34.7 ms | 57 /s | 11.8% |
 
-## Reading the numbers honestly
+## Storage and the metadata-write asymmetry
 
-- **Not a pure apples-to-apples on storage.** LakeCat writes metadata to a local
-  `file://` store (Turso spine); Nessie and Gravitino write table metadata to
-  MinIO over S3. A meaningful part of LakeCat's lower latency is local-fs vs an
-  S3 round-trip per commit, not just catalog code. To isolate catalog overhead,
-  LakeCat would need an S3 metadata backend too.
+- **Turso is LakeCat's catalog-state store, not table data.** It holds the
+  metadata pointer, pointer log, idempotency, audit, and outbox rows — the
+  analogue of Polaris's metastore, Nessie's version store, and Gravitino's
+  backend (all also local/in-memory here). That part is a fair equivalent.
+- **The Iceberg `metadata.json` belongs in object storage for every catalog.**
+  Polaris/Nessie/Gravitino write one to MinIO per commit (verified: 1597 / 1693
+  S3 objects). LakeCat in the deferred build writes **none** (0 objects) — it
+  defers metadata materialization to Sail. So its number is catalog-state CAS
+  only and is not comparable. Pointing LakeCat at MinIO did not change this:
+  there was no metadata write to redirect.
+- **Fair LakeCat run (TODO):** build with `--features turso-local,sail-local`
+  and commit with an `s3://` table location so the real Sail engine builds and
+  PUTs a new `metadata.json` to MinIO each commit, exactly like the others.
 - **Conflict models differ, and that dominates the concurrent column.** Nessie
   enforces strict serializable commits: 8 writers committing to the *same* table
   mostly conflict (80.6%) and would retry, so its successful-commit rate is

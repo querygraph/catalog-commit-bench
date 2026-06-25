@@ -12,15 +12,26 @@
 #   docker compose --profile gravitino up -d gravitino
 services:
   # --- LakeCat (verified) -------------------------------------------------
+  # Joins the shared lakehouse network and points its object_store at the same
+  # MinIO the other catalogs use, so its Iceberg metadata.json writes hit S3 too
+  # (fair comparison). Turso stays as LakeCat's local catalog-state store — the
+  # analogue of Polaris/Nessie/Gravitino's own metastores, which are also local.
+  # Create tables with --location s3://warehouse/lakecat so commits write to MinIO.
   lakecat:
     build:
       context: ./docker/lakecat
     image: lakecat-service:bench
+    networks: [lakehouse-net]
     ports: ["8181:8181"]
     environment:
       LAKECAT_BIND_ADDR: 0.0.0.0:8181
       LAKECAT_WAREHOUSE: local
       LAKECAT_TURSO_PATH: /data/lakecat.db
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
     volumes:
       - lakecat-data:/data
 
@@ -68,3 +79,9 @@ services:
 
 volumes:
   lakecat-data:
+
+networks:
+  # Shared with the ~/src/boat catalog stack so LakeCat can reach the same MinIO.
+  lakehouse-net:
+    name: iceberg_lakehouse-net
+    external: true

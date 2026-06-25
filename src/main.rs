@@ -49,6 +49,12 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     warmup: u64,
 
+    /// Optional explicit table location for createTable (e.g. s3://warehouse/lakecat).
+    /// Lets a catalog that doesn't derive a warehouse location write metadata to
+    /// the same object store as the others (used for LakeCat -> MinIO).
+    #[arg(long)]
+    location: Option<String>,
+
     /// Sequential commits to measure for the latency phase.
     #[arg(long, default_value_t = 1000)]
     iterations: u64,
@@ -84,6 +90,7 @@ struct Catalog {
     prefix: String,
     token: Option<String>,
     commit_suffix: String,
+    location: Option<String>,
 }
 
 impl Catalog {
@@ -125,7 +132,7 @@ impl Catalog {
     }
 
     async fn create_table(&self, ns: &str, table: &str) -> Result<()> {
-        let body = json!({
+        let mut body = json!({
             "name": table,
             "schema": {
                 "type": "struct",
@@ -138,6 +145,9 @@ impl Catalog {
             // Optional in the spec, but Nessie requires it; harmless elsewhere.
             "stage-create": false
         });
+        if let Some(loc) = &self.location {
+            body["location"] = json!(loc);
+        }
         let resp = self
             .req(self.http.post(self.tables_path(ns)))
             .json(&body)
@@ -209,6 +219,7 @@ async fn main() -> Result<()> {
         prefix: args.prefix.clone(),
         token: args.token.clone(),
         commit_suffix: args.commit_suffix.clone(),
+        location: args.location.clone(),
     });
 
     if args.create {
