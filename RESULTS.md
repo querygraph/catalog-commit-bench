@@ -39,9 +39,24 @@ a shared MinIO/S3 backend); LakeCat from this repo's image.
   defers metadata materialization to Sail. So its number is catalog-state CAS
   only and is not comparable. Pointing LakeCat at MinIO did not change this:
   there was no metadata write to redirect.
-- **Fair LakeCat run (TODO):** build with `--features turso-local,sail-local`
-  and commit with an `s3://` table location so the real Sail engine builds and
-  PUTs a new `metadata.json` to MinIO each commit, exactly like the others.
+- **Fair LakeCat run — attempted, currently blocked.** Built
+  `lakecat-service --features turso-local,sail-local` (Sail needs `protoc` and
+  links `libpython3.11`), pointed at MinIO with an `s3://` table location. Result:
+  - `createTable` stores metadata inline in Turso, never PUTs the `metadata.json`
+    to S3 (0 objects).
+  - a no-op commit succeeds but reuses the never-written metadata location.
+  - a real `set-properties` commit — the one that should write a new
+    `metadata.json` — **fails**: Sail's engine rejects LakeCat's
+    catalog-synthesized metadata with `missing field uuid`.
+  So a fair, metadata-writing LakeCat number is **not yet obtainable**. The
+  blocker is a real LakeCat↔Sail gap: the `createTable` conformance fix
+  synthesizes Iceberg metadata *in the catalog* (a minimal hand-rolled doc), and
+  the deferred path accepts it, but the real Sail engine cannot apply an update
+  to it. This validates LakeCat's own thesis — table-format metadata should be
+  built by the engine (Sail), not hand-rolled in the catalog. The correct fix is
+  to route initial-metadata creation through the `SailCatalogEngine` so create
+  and commit use the same engine-built metadata. Until then, LakeCat is not
+  measured on equal footing here.
 - **Conflict models differ, and that dominates the concurrent column.** Nessie
   enforces strict serializable commits: 8 writers committing to the *same* table
   mostly conflict (80.6%) and would retry, so its successful-commit rate is

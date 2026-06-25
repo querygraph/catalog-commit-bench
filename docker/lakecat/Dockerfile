@@ -6,8 +6,10 @@
 # (where the siblings exist) via docker/build-lakecat.sh and package it here.
 FROM debian:bookworm-slim
 
+# libpython3.11 is required at runtime when the binary is built with the
+# sail-local feature (Sail links libpython); harmless for deferred builds.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libpython3.11 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY lakecat-service /usr/local/bin/lakecat-service

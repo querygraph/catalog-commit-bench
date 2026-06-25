@@ -16,14 +16,17 @@ src_root="${SRC_ROOT:-$(cd "$bench_repo/.." && pwd)}"   # dir containing lakecat
 target_dir="$bench_repo/.linux-target"
 mkdir -p "$target_dir"
 
-echo "Building lakecat-service (release, turso-local) for Linux via container ..."
+features="${FEATURES:-turso-local}"
+echo "Building lakecat-service (release, features=$features) for Linux via container ..."
+# sail-local pulls in Sail/DataFusion which need protoc at build time.
 docker run --rm \
   -v "$src_root":/src \
   -v catalog-bench-cargo-registry:/usr/local/cargo/registry \
   -w /src/lakecat \
   rust:1-bookworm \
-  cargo build -p lakecat-service --release --features turso-local \
-    --target-dir /src/"$(basename "$bench_repo")"/.linux-target
+  sh -c "apt-get update >/dev/null && apt-get install -y protobuf-compiler python3-dev libpython3.11-dev >/dev/null && \
+    cargo build -p lakecat-service --release --features '$features' \
+    --target-dir /src/$(basename "$bench_repo")/.linux-target"
 
 bin="$target_dir/release/lakecat-service"
 [[ -f "$bin" ]] || { echo "binary not found: $bin" >&2; exit 1; }
