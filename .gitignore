@@ -1,1 +1,3 @@
 target
+.linux-target
+docker/lakecat/lakecat-service

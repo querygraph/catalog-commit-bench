@@ -1,0 +1,70 @@
+# Reproducible commit-benchmark harness for Iceberg REST catalogs.
+#
+# LakeCat is fully wired and verified here. Polaris, Gravitino, and Unity are
+# included behind compose profiles with best-effort upstream images + config;
+# each needs a bootstrap or auth step that is NOT hands-off (see README
+# "Bootstrap caveats"). Bring up only what you need, e.g.:
+#
+#   docker/build-lakecat.sh && docker compose up -d lakecat
+#   docker compose run --rm bench --base-url http://lakecat:8181/catalog --create
+#
+# or enable an external catalog by profile:
+#   docker compose --profile gravitino up -d gravitino
+services:
+  # --- LakeCat (verified) -------------------------------------------------
+  lakecat:
+    build:
+      context: ./docker/lakecat
+    image: lakecat-service:bench
+    ports: ["8181:8181"]
+    environment:
+      LAKECAT_BIND_ADDR: 0.0.0.0:8181
+      LAKECAT_WAREHOUSE: local
+      LAKECAT_TURSO_PATH: /data/lakecat.db
+    volumes:
+      - lakecat-data:/data
+
+  # --- Apache Polaris (best-effort; OAuth2 bootstrap required) -------------
+  # Polaris bootstraps a root principal on first run and prints its
+  # client_id/secret to the logs. Exchange them for a bearer token, then pass it
+  # to the bench with --token. There is no fully hands-off default.
+  polaris:
+    image: apache/polaris:latest
+    ports: ["8182:8181"]
+    profiles: ["polaris"]
+    environment:
+      POLARIS_BOOTSTRAP_CREDENTIALS: "default-realm,root,s3cr3t"
+
+  # --- Apache Gravitino Iceberg REST server (best-effort) -----------------
+  # Memory-backed Iceberg REST catalog. Confirm the image tag exposes the REST
+  # service on 9001; older tags differ.
+  gravitino:
+    image: apache/gravitino-iceberg-rest:latest
+    ports: ["9001:9001"]
+    profiles: ["gravitino"]
+    environment:
+      GRAVITINO_ICEBERG_REST_CATALOG_BACKEND: memory
+      GRAVITINO_ICEBERG_REST_CATALOG_WAREHOUSE: /tmp/gravitino-warehouse
+
+  # --- Unity Catalog OSS (best-effort; verify write support) --------------
+  # Unity OSS has historically focused on Iceberg READS for external clients.
+  # Confirm your build accepts external updateTable commits before trusting the
+  # write numbers.
+  unitycatalog:
+    image: unitycatalog/unitycatalog:latest
+    ports: ["8080:8080"]
+    profiles: ["unity"]
+
+  # --- The benchmark itself -----------------------------------------------
+  # Override the command per target, e.g.:
+  #   docker compose run --rm bench --base-url http://lakecat:8181/catalog --create
+  bench:
+    build:
+      context: .
+      dockerfile: docker/bench.Dockerfile
+    image: catalog-commit-bench:latest
+    profiles: ["bench"]
+    entrypoint: ["/usr/local/bin/catalog-commit-bench"]
+
+volumes:
+  lakecat-data:
