@@ -1,102 +1,79 @@
-> ## ⚠️ Correction: the LakeCat row below is NOT comparable
->
-> Verified empirically (MinIO object counts after a benchmark run): a standard
-> Iceberg commit writes a new `metadata.json` to object storage and advances the
-> pointer. Polaris, Nessie, and Gravitino each did this — thousands of S3 objects.
-> **LakeCat in the default/deferred build wrote ZERO objects** — its
-> `set-properties` commit only does the Turso pointer CAS + audit/outbox;
-> Iceberg metadata materialization is deferred to Sail, which is absent without
-> the `sail-local` feature. So LakeCat's numbers measure a *strictly lighter*
-> operation (catalog-state CAS, no metadata-file write) and must not be compared
-> head-to-head with the others. A fair LakeCat number requires building
-> `lakecat-service` with `--features turso-local,sail-local` so the real Sail
-> engine builds and writes a new `metadata.json` to S3 per commit. See "Storage
-> and the metadata-write asymmetry" below.
-
 # Commit-path results
 
 Same host, same driver, identical parameters: **1000 sequential commits**, then
 **8 concurrent writers for 6 s**, `set-properties` commits (no data files).
-Catalogs brought up from `~/src/boat/docker-compose.yml` (Nessie + Gravitino on
-a shared MinIO/S3 backend); LakeCat from this repo's image.
+Catalogs brought up from `~/src/boat/docker-compose.yml` (Nessie, Gravitino,
+Polaris on a shared MinIO/S3 backend); LakeCat from this repo's image, built with
+`--features turso-local,sail-local` and pointed at the same MinIO.
 
-| Catalog | Storage backend | Seq throughput | Seq p50 | Seq p99 | Concurrent (8w) | Conflict rate |
+**All four now do the same unit of work**: validate the commit, apply the
+updates, write a new `metadata.json` to S3, and advance the pointer (verified by
+MinIO object counts — LakeCat wrote 1283 objects across this run).
+
+| Catalog | Storage | Seq throughput | Seq p50 | Seq p99 | Concurrent (8w) | Conflict rate |
 |---|---|---|---|---|---|---|
-| **LakeCat** 0.1.1 ⚠️ | Turso CAS only, **no metadata write** | 303 /s | 2.4 ms | 13.2 ms | 379 /s | 0% |
 | **Gravitino** (iceberg-rest) | MinIO / S3 | 116 /s | 8.1 ms | 16.9 ms | 220 /s | 0% |
-| **Nessie** 0.107.5 | MinIO / S3 | 98 /s | 9.7 ms | 23.0 ms | 107 /s | **80.6%** |
+| **Nessie** 0.107.5 | MinIO / S3 | 98 /s | 9.7 ms | 23.0 ms | 107 /s | 80.6% |
+| **LakeCat** 0.1.1 (sail-local) | MinIO / S3 (Turso state) | 92.5 /s | 9.9 ms | 21.3 ms | 38.5 /s | 85.2% |
 | **Polaris** 1.5.0 | MinIO / S3 | 57 /s | 16.6 ms | 34.7 ms | 57 /s | 11.8% |
 
-## Storage and the metadata-write asymmetry
+Sequential throughput is the clean cross-catalog signal: **Gravitino 116 >
+Nessie 98 ≈ LakeCat 92.5 > Polaris 57 /s**. LakeCat now sits right alongside
+Nessie — the earlier "303 /s, 0 conflicts" was an artifact of not writing
+metadata at all (see history below).
+
+The concurrent column reflects **commit-conflict policy**, not raw speed: LakeCat
+(85.2%) and Nessie (80.6%) enforce strict optimistic concurrency — 8 writers to
+the *same* table mostly conflict and would retry — so their successful-commit
+rate is lower by design. Gravitino (0%) and Polaris (11.8%) accept concurrent
+`set-properties` more permissively.
+
+## How the fair LakeCat run was obtained (two fixes)
+
+The first LakeCat run was **not comparable** (303 /s, 0 metadata objects): the
+default build never materialized a `metadata.json`. Two fixes made it do the
+real work:
+
+1. **Sail applies the updates** — `sail_iceberg::spec::metadata::apply_table_updates`
+   evolves the current `TableMetadata` by the REST updates; `lakecat-sail`'s
+   `prepare_commit` now parses the updates into the typed `TableUpdate` enum,
+   applies them, and emits a fresh `metadata.json` + new metadata-location, so
+   LakeCat writes a real object to S3 per commit and advances the pointer.
+2. **Turso writes are serialized** — the local Turso file is single-writer, so 8
+   concurrent commit transactions hit `database is locked`. `lakecat-store` now
+   serializes write transactions through a per-store async mutex (+ best-effort
+   WAL/busy_timeout). The concurrent phase now runs cleanly.
+
+## Notes on fairness
 
 - **Turso is LakeCat's catalog-state store, not table data.** It holds the
   metadata pointer, pointer log, idempotency, audit, and outbox rows — the
   analogue of Polaris's metastore, Nessie's version store, and Gravitino's
-  backend (all also local/in-memory here). That part is a fair equivalent.
-- **The Iceberg `metadata.json` belongs in object storage for every catalog.**
-  Polaris/Nessie/Gravitino write one to MinIO per commit (verified: 1597 / 1693
-  S3 objects). LakeCat in the deferred build writes **none** (0 objects) — it
-  defers metadata materialization to Sail. So its number is catalog-state CAS
-  only and is not comparable. Pointing LakeCat at MinIO did not change this:
-  there was no metadata write to redirect.
-- **Fair LakeCat run — attempted, currently blocked.** Built
-  `lakecat-service --features turso-local,sail-local` (Sail needs `protoc` and
-  links `libpython3.11`), pointed at MinIO with an `s3://` table location. Result:
-  - `createTable` stores metadata inline in Turso, never PUTs the `metadata.json`
-    to S3 (0 objects).
-  - a no-op commit succeeds but reuses the never-written metadata location.
-  - a real `set-properties` commit — the one that should write a new
-    `metadata.json` — **fails**: Sail's engine rejects LakeCat's
-    catalog-synthesized metadata with `missing field uuid`.
-  So a fair, metadata-writing LakeCat number is **not obtainable without feature
-  work**. Root cause, pinned by reading the code (not the table metadata, as
-  first thought):
-  1. `lakecat-sail`'s `prepare_commit` validates the commit request against
-     Sail's generated `models::CommitTableRequest`, whose `updates` use
-     `models::TableUpdate` — a **degenerate flat struct with every field
-     required** (`uuid`, `format-version`, `schema`, …) rather than a tagged
-     union. So any real update fails: a `set-properties` commit reports
-     `missing field uuid`. (This is a bug in Sail's generated
-     `sail-catalog-iceberg` models; `BaseUpdate` is the correct tagged enum.)
-  2. More fundamentally, `prepare_commit` does
-     `new_metadata = request.new_metadata.unwrap_or(current_metadata)` — it
-     **never applies the `MetadataUpdate`s** to build new metadata, and only
-     writes an object when the *request* already carries `new_metadata_location`.
-     LakeCat expects metadata to be authored by the client/engine, not built
-     server-side from REST updates.
+  backend (all also local/in-memory here). The Iceberg `metadata.json` itself
+  goes to S3/MinIO for every catalog, LakeCat included.
+- **Polaris is heaviest per commit** — RBAC checks and credential subscoping on
+  top of the S3 write (16.6 ms p50). That's governance cost.
+- **The concurrent column is commit-conflict policy, not speed.** Strict-CAS
+  catalogs (LakeCat 85%, Nessie 81%) show low successful throughput under 8
+  writers to one table because most commits correctly conflict and retry.
 
-  **Post-fix update.** With the Sail `TableUpdate` discriminator fix applied
-  (lakehq/sail#2134), a `set-properties` commit now returns 200 instead of
-  `missing field uuid` — the model bug is resolved. But it changes nothing about
-  the metadata write: LakeCat still writes **0** objects to MinIO, and the
-  committed table's `properties` stay `{}` (the update is not applied). Two gaps
-  remain, independent of the model fix: (a) `prepare_commit` never applies the
-  updates or materializes a new `metadata.json`; (b) under 8 concurrent writers
-  the Turso store fails with `database is locked` (single-writer is fine,
-  ~416 commits/s seq, p50 2.2 ms). So a fair, metadata-writing, concurrent
-  LakeCat number is still not achievable.
+## History: why the first LakeCat run was wrong (303 /s, 0 objects)
 
-  Therefore LakeCat, as built, does not implement the "apply REST updates →
-  new metadata.json → PUT to object store → advance pointer" commit semantics
-  that Polaris/Nessie/Gravitino implement. Making it comparable is **feature
-  work**, not a benchmark tweak: (a) fix/relax the commit-request validation to
-  the tagged `BaseUpdate`, and (b) apply `MetadataUpdate`s server-side (the
-  Sail-owned table-format step) and write the resulting metadata. Until that
-  exists, LakeCat's commit measures catalog-state CAS only and is not on equal
-  footing.
-- **Conflict models differ, and that dominates the concurrent column.** Nessie
-  enforces strict serializable commits: 8 writers committing to the *same* table
-  mostly conflict (80.6%) and would retry, so its successful-commit rate is
-  lower by design. LakeCat and Gravitino accept the concurrent `set-properties`
-  commits without conflict under `assert-table-uuid`. So "concurrent
-  throughput" compares *commit-serialization policy* as much as raw speed —
-  Nessie's number reflects correctness strictness, not a slow path.
-- **Sequential throughput is the cleaner cross-catalog signal.** There,
-  contention is removed and each number is per-commit catalog cost (plus the
-  storage caveat above): LakeCat 303 > Gravitino 116 > Nessie 98 > Polaris 57 /s.
-- **Polaris is the heaviest per commit** — it runs RBAC checks and credential
-  subscoping in addition to the S3 metadata write, which shows in its 16.6 ms
-  p50. That is governance cost, the same category of work LakeCat does inline.
+The initial run reported 303 /s and 0% conflicts because the default LakeCat
+build **never wrote a `metadata.json`** — its `set-properties` commit only did a
+Turso pointer CAS. Verified by MinIO object counts (Polaris/Nessie/Gravitino
+wrote 1500–1700 objects; LakeCat wrote 0). Getting an honest number took three
+fixes, in order:
+
+1. **Sail `TableUpdate`/`ViewUpdate` discriminator** (lakehq/sail#2134) — the
+   generated REST model was a flat all-required struct, so any real update
+   failed to deserialize (`missing field uuid`). Now a tagged enum.
+2. **Sail applies the updates** (`apply_table_updates`) + `lakecat-sail`
+   `prepare_commit` rewrite — evolve the current metadata by the typed updates,
+   emit a fresh `metadata.json` + new location, write it to S3, advance the
+   pointer. This is what put LakeCat on equal footing (and dropped 303 → 92.5).
+3. **Turso write serialization** — single-writer file + 8 concurrent commits =
+   `database is locked`; serialized via a per-store async mutex.
 
 ## Reproduce
 
