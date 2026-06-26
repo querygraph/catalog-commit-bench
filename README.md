@@ -85,8 +85,8 @@ NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://minio:9000
 Bring them up and create the bucket:
 
 ```sh
-cd ~/src/boat && docker compose up -d minio nessie gravitino
-#   (+ polaris — needs an OAuth2 bootstrap step, see "Bootstrap caveats")
+cd ~/src/boat && docker compose up -d minio nessie gravitino polaris
+#   (polaris is auto-bootstrapped by polaris-bootstrap.sh — see step 4)
 docker run --rm --network iceberg_lakehouse-net --entrypoint sh minio/mc -c \
   "mc alias set m http://minio:9000 admin password && mc mb -p m/warehouse"
 ```
@@ -219,11 +219,12 @@ catalog-commit-bench --base-url http://127.0.0.1:9002/iceberg $P
 ```
 
 ### Apache Polaris
-OAuth2: bootstrap a root principal, exchange for a bearer token, pass it; the
-prefix is the catalog name.
+OAuth2: `polaris-bootstrap.sh` fetches a token and creates an S3 catalog on the
+shared MinIO `warehouse` bucket; the prefix is the catalog name.
 ```sh
+TOKEN=$(./polaris-bootstrap.sh)
 catalog-commit-bench --base-url http://127.0.0.1:8185/api/catalog \
-  --prefix bench --token "$POLARIS_TOKEN" $P
+  --prefix bench --token "$TOKEN" $P
 ```
 
 ### Unity Catalog (OSS)
@@ -237,9 +238,11 @@ catalog-commit-bench --base-url http://127.0.0.1:8080/api/2.1/unity-catalog/iceb
 
 ## Bootstrap caveats (the externals are not turnkey)
 
-- **Polaris** bootstraps a root principal on first run and prints its
-  client_id/secret to the logs; exchange them via the OAuth2 token endpoint and
-  pass the result as `POLARIS_TOKEN`. Prefix = catalog name.
+- **Polaris** needs an OAuth2 token + an S3 catalog (it does not auto-serve a
+  warehouse). `polaris-bootstrap.sh` automates both — client creds `root`/`secret`,
+  catalog `bench` on `s3://warehouse/bench`, `stsUnavailable`+`pathStyle` for MinIO
+  — and `bench-stack.sh` calls it automatically. Override creds via
+  `POLARIS_CLIENT_ID`/`POLARIS_CLIENT_SECRET`, or pass a ready `POLARIS_TOKEN`.
 - **Gravitino** uses the `apache/gravitino-iceberg-rest` image; confirm your tag
   serves the REST API on the expected port (older tags differ).
 - **Unity (OSS)** verify it accepts external `updateTable` commits before trusting

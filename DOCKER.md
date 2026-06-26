@@ -94,10 +94,11 @@ docker compose --profile unity     up -d unitycatalog
 
 ## Bootstrap caveats (the externals are not turnkey)
 
-- **Polaris** bootstraps a root principal on first run and prints its
-  client_id/secret to the logs; exchange them via its OAuth2 token endpoint and
-  pass the result as `POLARIS_TOKEN`. Prefix = catalog name. Spec-conformant commit
-  path.
+- **Polaris** needs an OAuth2 token + an S3 catalog (no auto-served warehouse).
+  `polaris-bootstrap.sh` automates both (token via client creds `root`/`secret`,
+  catalog `bench` on `s3://warehouse/bench`); `bench-stack.sh` calls it
+  automatically, or pass a ready `POLARIS_TOKEN`. Prefix = catalog name.
+  Spec-conformant commit path.
 - **Gravitino** uses the `apache/gravitino-iceberg-rest` image with a memory
   backend. Confirm your tag serves the REST API on the expected port; older tags
   differ. Spec-conformant.

@@ -14,25 +14,28 @@ counts).
 
 | Catalog | Storage | Seq throughput | Seq p50 | Seq p99 | Concurrent (8w) | Conflict rate |
 |---|---|---|---|---|---|---|
-| **Nessie** 0.107.5 | MinIO / S3 | 250.8 /s | 3.64 ms | 8.0 ms | 162.7 /s | 80.9% |
-| **LakeCat** 0.2.0 | MinIO / S3 (Turso state) | 207.3 /s | 4.14 ms | 11.4 ms | 310.5 /s | 72.9% |
-| **Gravitino** (iceberg-rest) | MinIO / S3 | 164.8 /s | 5.75 ms | 10.9 ms | 337.3 /s | 0% |
+| **Nessie** 0.107.5 | MinIO / S3 | 228.6 /s | 4.04 ms | 8.4 ms | 164.0 /s | 81.6% |
+| **LakeCat** 0.2.0 | MinIO / S3 (Turso state) | 198.2 /s | 4.52 ms | 10.7 ms | 311.6 /s | 73.7% |
+| **Gravitino** (iceberg-rest) | MinIO / S3 | 163.9 /s | 5.74 ms | 11.2 ms | 340.2 /s | 0% |
+| **Polaris** 1.5.0 | MinIO / S3 | 97.6 /s | 9.81 ms | 16.9 ms | 91.5 /s | 5.78% |
 
-(Polaris 1.5.0 was not re-run this round; in an earlier run it was the heaviest per
-commit at ~16.6 ms p50, owing to RBAC + credential subscoping on top of the S3
-write.)
+(All four in one `bench-stack.sh` sweep; Polaris is auto-bootstrapped — an OAuth2
+token + an S3 catalog on the same `warehouse` bucket — by `polaris-bootstrap.sh`.)
 
-**LakeCat 0.2.0 is now competitive with the mature Java catalogs.** Its commit p50
-(4.14 ms) is *faster* than Gravitino's (5.75 ms) and within ~14% of Nessie's
-(3.64 ms), and it is **#2 on concurrent throughput** (310 /s — behind Gravitino's
-337, ~1.9× Nessie). That is a large change from 0.1.1, where LakeCat's commit p50
-was 9.9 ms and its concurrent throughput was the worst of the field (38.5 /s).
+**LakeCat 0.2.0 is now competitive with the mature Java catalogs — #2 on both
+axes.** Its commit p50 (4.52 ms) is *faster* than Gravitino (5.74 ms) and Polaris
+(9.81 ms) and within ~13% of Nessie (4.04 ms); on concurrent throughput it is **#2**
+(312 /s, behind Gravitino's 340, ~1.9× Nessie). That is a large change from 0.1.1,
+where LakeCat's commit p50 was 9.9 ms and its concurrent throughput was the worst of
+the field (38.5 /s).
 
 The concurrent column reflects **commit-conflict policy** as much as raw speed:
-LakeCat (72.9%) and Nessie (80.9%) enforce strict optimistic concurrency — 8
-writers to the *same* table mostly conflict and retry, so successful throughput is
-held down by design — while Gravitino (0%) accepts concurrent `set-properties` more
-permissively.
+LakeCat (74%) and Nessie (82%) enforce strict optimistic concurrency — 8 writers to
+the *same* table mostly conflict and retry, so successful throughput is held down by
+design — while Gravitino (0%) and Polaris (6%) accept concurrent `set-properties`
+more permissively. **Polaris is the heaviest per commit** (9.81 ms p50) owing to
+RBAC checks + credential subscoping on top of the S3 write — that is governance
+cost, not inefficiency.
 
 ## How LakeCat got here (0.1.1 → 0.2.0)
 
@@ -100,8 +103,7 @@ fixes, in order:
 
 ```sh
 # 1. shared catalog stack + MinIO + network (from ~/src/boat)
-cd ~/src/boat && docker compose up -d minio nessie gravitino
-#    (polaris is optional and needs an OAuth2 bootstrap step)
+cd ~/src/boat && docker compose up -d minio nessie gravitino polaris
 
 # 2. build LakeCat from source, deploy its image, and bench every reachable catalog
 cd ~/src/catalog-commit-bench && ./bench-stack.sh
@@ -110,7 +112,9 @@ cd ~/src/catalog-commit-bench && ./bench-stack.sh
 `bench-stack.sh` builds `lakecat-service` for Linux (Sail fetched from the
 `querygraph/sail` git dep), packages + restarts the container, ensures the MinIO
 `warehouse` bucket, and runs the identical `--create` + commit measurement against
-each reachable catalog (LakeCat with `--location s3://warehouse/lakecat`).
+each reachable catalog (LakeCat with `--location s3://warehouse/lakecat`). Polaris
+is auto-bootstrapped via `polaris-bootstrap.sh` (OAuth2 token + an S3 catalog on the
+same `warehouse` bucket); set `POLARIS_TOKEN` to skip the bootstrap.
 
 ## Not measured
 

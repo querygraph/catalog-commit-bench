@@ -85,6 +85,16 @@ if reachable http://127.0.0.1:9002/iceberg; then
   run_one "Gravitino" "http://127.0.0.1:9002/iceberg"
 else echo "skip Gravitino: :9002 not reachable"; fi
 
-if [[ -n "${POLARIS_TOKEN:-}" ]] && reachable http://127.0.0.1:8185/api/catalog; then
-  run_one "Polaris" "http://127.0.0.1:8185/api/catalog" --prefix "${POLARIS_PREFIX:-bench}" --token "$POLARIS_TOKEN"
-else echo "skip Polaris: set POLARIS_TOKEN and ensure :8185 is up"; fi
+# Polaris: auto-bootstrap an OAuth2 token + S3 catalog when no token is provided.
+# (Its /v1/config 401s without a token, so we probe via the bootstrap itself.)
+POLARIS_BASE="${POLARIS_BASE:-http://127.0.0.1:8185}"
+polaris_token="${POLARIS_TOKEN:-}"
+if [[ -z "$polaris_token" ]]; then
+  polaris_token="$(./polaris-bootstrap.sh || true)"
+fi
+if [[ -n "$polaris_token" ]]; then
+  run_one "Polaris" "$POLARIS_BASE/api/catalog" \
+    --prefix "${POLARIS_CATALOG:-bench}" --token "$polaris_token"
+else
+  echo "skip Polaris: not reachable (bootstrap failed); bring it up from ~/src/boat"
+fi
