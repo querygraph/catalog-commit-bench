@@ -1,106 +1,282 @@
 # catalog-commit-bench
 
-A catalog-agnostic benchmark for the **commit path** of Iceberg REST catalogs.
+A catalog-agnostic benchmark for the **commit path** of Iceberg REST catalogs —
+**LakeCat, Apache Polaris, Apache Gravitino, Apache Nessie, and Unity Catalog**.
 
-TPC-DS/TPC-H measure query engines; they touch the catalog only incidentally.
-This driver isolates the part those benchmarks ignore: the catalog commit
-transaction — update validation, the new metadata write, the metadata-pointer
-compare-and-swap, and durable persistence. It issues `set-properties` commits
-(no data files), so each request exercises the catalog's commit machinery
-without engine or storage-write noise.
+TPC-DS/TPC-H measure query engines; they touch the catalog only incidentally. This
+driver isolates the part those benchmarks ignore: the catalog **commit transaction**
+— update validation, writing the new `metadata.json`, the metadata-pointer
+compare-and-swap, and durable persistence. It issues `set-properties` commits (no
+data files), so each request exercises the catalog's commit machinery without
+engine or data-write noise. Every target speaks the same Iceberg REST protocol, so
+one binary benchmarks all of them; only the base URL, prefix, and auth differ.
 
-Because every target speaks the Iceberg REST Catalog protocol, the same binary
-runs against **LakeCat, Apache Polaris, Apache Gravitino, and Unity Catalog**
-— only the base URL, prefix, auth, and (for LakeCat) the commit path differ.
+See **[RESULTS.md](RESULTS.md)** for a measured cross-catalog comparison.
 
-## Phases
+## What it measures
 
-1. **Sequential latency** — `--iterations` commits in series; reports
-   throughput and p50/p90/p99/max latency. This is the clean per-commit cost.
+1. **Sequential latency** — `--iterations` commits in series; reports throughput
+   and p50/p90/p99/max latency. The clean per-commit cost.
 2. **Concurrent throughput** — `--concurrency` writers committing for
-   `--duration-secs`; reports committed/s and the 409 conflict rate. This is the
+   `--duration-secs`; reports committed/s and the 409 conflict rate. The
    CAS-contention behavior.
 
-## Build
+## Impartiality: one object store, one unit of work
+
+A commit-path comparison is only fair if every catalog does the **same work** to
+the **same storage**. The harness is built around that:
+
+- **Same object store.** Every catalog writes its Iceberg `metadata.json` to the
+  **same MinIO/S3 bucket** (`s3://warehouse`). Each catalog's own state store
+  (Turso for LakeCat, the version store for Nessie, the metastore for
+  Polaris/Gravitino) is its private metadata-pointer bookkeeping — the analogue
+  across all of them — but the Iceberg metadata object itself lands in the shared
+  MinIO for everyone. Without this, you would be comparing object stores, not
+  catalogs.
+- **Same unit of work.** A `set-properties` commit: validate → apply the update →
+  write a fresh `metadata.json` to S3 → advance the pointer. No data files, no
+  engine. Verify it with MinIO object counts — every catalog should write ~1
+  object per commit (a catalog that writes 0 is doing no real metadata work).
+- **Same parameters, same host/network.** Identical `--iterations` /
+  `--concurrency` / `--duration-secs`, and all containers on one Docker network so
+  latency is not confounded by cross-host RTT.
+- **Same request shape.** All use the standard `POST namespaces` / `POST tables` /
+  bare `POST tables/{t}` commit. LakeCat takes `--location s3://warehouse/lakecat`
+  because it does not derive an S3 warehouse location on its own; the others get
+  their S3 warehouse from their config.
+
+## Docker setup for impartial runs with MinIO
+
+Everything shares one **external** Docker network and one **MinIO**, so the
+catalogs and the benchmark resolve each other by service name and write to the same
+bucket.
+
+```
+                       iceberg_lakehouse-net  (external docker network)
+   ┌───────────┐   ┌──────────┐   ┌───────────┐   ┌──────────┐   ┌──────────────┐
+   │  lakecat  │   │  nessie  │   │ gravitino │   │ polaris  │   │ catalog-     │
+   │  :8181    │   │  :19120  │   │  :9001    │   │  :8181   │   │ commit-bench │
+   └─────┬─────┘   └────┬─────┘   └─────┬─────┘   └────┬─────┘   └──────┬───────┘
+         └──────────────┴───── s3://warehouse ─────────┴────────────────┘
+                              ┌──────────────┐
+                              │ minio :9000  │   admin / password, path-style
+                              └──────────────┘
+```
+
+### 1. Create the shared network
+
+```sh
+docker network create iceberg_lakehouse-net
+```
+
+### 2. Bring up MinIO + the comparison catalogs
+
+The comparison catalogs (MinIO, Nessie, Gravitino, Polaris) come from the sibling
+`boat` stack. Every service joins `iceberg_lakehouse-net` and is configured to use
+`s3://warehouse/` on MinIO — same credentials (`admin`/`password`), path-style
+access, region `us-east-1`, endpoint `http://minio:9000`. For example, Nessie:
+
+```yaml
+NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/
+NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://minio:9000
+```
+
+Bring them up and create the bucket:
+
+```sh
+cd ~/src/boat && docker compose up -d minio nessie gravitino
+#   (+ polaris — needs an OAuth2 bootstrap step, see "Bootstrap caveats")
+docker run --rm --network iceberg_lakehouse-net --entrypoint sh minio/mc -c \
+  "mc alias set m http://minio:9000 admin password && mc mb -p m/warehouse"
+```
+
+### 3. The benchmark's own compose (LakeCat + the driver)
+
+This repo's `docker-compose.yml` runs LakeCat — built from source into a Linux
+image — on the same network, with its `object_store` pointed at the same MinIO. The
+LakeCat `environment` block (`AWS_ENDPOINT: http://minio:9000`, `admin`/`password`)
+is what makes its `metadata.json` writes hit the shared bucket:
+
+```yaml
+services:
+  # LakeCat: joins the shared network and points its object_store at the same
+  # MinIO the other catalogs use, so its Iceberg metadata.json writes hit S3 too.
+  # Turso stays LakeCat's local catalog-state store (the analogue of the others'
+  # metastores). Create tables with --location s3://warehouse/lakecat.
+  lakecat:
+    build:
+      context: ./docker/lakecat
+    image: lakecat-service:bench
+    networks: [lakehouse-net]
+    ports: ["8181:8181"]
+    environment:
+      LAKECAT_BIND_ADDR: 0.0.0.0:8181
+      LAKECAT_WAREHOUSE: local
+      LAKECAT_TURSO_PATH: /data/lakecat.db
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+    volumes:
+      - lakecat-data:/data
+
+  # Comparison catalogs are usually run from ~/src/boat, but are also available
+  # here behind profiles for a self-contained stack:
+  polaris:                       # docker compose --profile polaris up -d polaris
+    image: apache/polaris:latest
+    ports: ["8182:8181"]
+    profiles: ["polaris"]
+    environment:
+      POLARIS_BOOTSTRAP_CREDENTIALS: "default-realm,root,s3cr3t"
+  gravitino:                     # docker compose --profile gravitino up -d gravitino
+    image: apache/gravitino-iceberg-rest:latest
+    ports: ["9001:9001"]
+    profiles: ["gravitino"]
+    environment:
+      GRAVITINO_ICEBERG_REST_CATALOG_BACKEND: memory
+      GRAVITINO_ICEBERG_REST_CATALOG_WAREHOUSE: /tmp/gravitino-warehouse
+  unitycatalog:                  # docker compose --profile unity up -d unitycatalog
+    image: unitycatalog/unitycatalog:latest
+    ports: ["8080:8080"]
+    profiles: ["unity"]
+
+  # The benchmark itself, as a container (or run the host binary).
+  bench:                         # docker compose run --rm bench --base-url ... --create
+    build:
+      context: .
+      dockerfile: docker/bench.Dockerfile
+    image: catalog-commit-bench:latest
+    profiles: ["bench"]
+    entrypoint: ["/usr/local/bin/catalog-commit-bench"]
+
+volumes:
+  lakecat-data:
+
+networks:
+  # Shared (external) with the ~/src/boat catalog stack so every catalog reaches
+  # the same MinIO. Create it once: `docker network create iceberg_lakehouse-net`.
+  lakehouse-net:
+    name: iceberg_lakehouse-net
+    external: true
+```
+
+**Why LakeCat is built from source.** LakeCat depends on Sail as a Cargo *git*
+dependency on `querygraph/sail#lakecat` (fetched at build time) and on Grust as a
+local path dependency. `docker/build-lakecat.sh` compiles `lakecat-service` for
+Linux inside a Rust container with `~/src` mounted (so `../grust` resolves and Sail
+is fetched over the network), stages the ELF, and `docker compose build lakecat`
+packages it into the slim runtime image.
+
+### 4. Build, deploy, and run — one command
+
+```sh
+./bench-stack.sh
+```
+
+`bench-stack.sh` builds `lakecat-service` for Linux, packages + (re)starts the
+LakeCat container, ensures the `warehouse` bucket exists, and benchmarks every
+reachable catalog with **identical** parameters — LakeCat with
+`--location s3://warehouse/lakecat` and idempotency, Nessie/Gravitino with their
+prefixes, Polaris when `POLARIS_TOKEN` is set. Tune with env vars:
+
+```sh
+ITER=2000 CONC=8 DUR=10 ./bench-stack.sh      # heavier run
+SKIP_BUILD=1 ./bench-stack.sh                 # skip the LakeCat rebuild
+POLARIS_TOKEN=... ./bench-stack.sh            # include Polaris
+```
+
+## Build the driver alone
 
 ```sh
 cargo build --release
 ```
 
-## Run recipes
+## Manual run recipes
 
-All four use the same standard endpoints (`POST namespaces`, `POST tables`,
-`GET tables/{t}`). They differ only in URL prefix, auth, and the commit path.
-
-### LakeCat
-LakeCat serves under `/catalog` and is spec-conformant on both `createTable` and
-the bare commit path, so it uses the standard invocation:
+All use the same standard endpoints; they differ only in URL prefix, auth, and
+(for LakeCat) the `--location` that pins writes to MinIO. Identical params:
 
 ```sh
-LAKECAT_BIND_ADDR=127.0.0.1:8181 LAKECAT_WAREHOUSE=local \
-  cargo run -p lakecat-service --features turso-local   # in the lakecat repo
-
-catalog-commit-bench \
-  --base-url http://127.0.0.1:8181/catalog \
-  --create --idempotency \
-  --iterations 2000 --concurrency 8 --duration-secs 10
+P="--namespace bench --table commits --create --iterations 1000 --concurrency 8 --duration-secs 6"
 ```
 
-### Apache Polaris
-Polaris is spec-conformant (bare commit path). It uses OAuth2 — fetch a token
-first, then pass it. The prefix is the catalog name.
-
+### LakeCat
 ```sh
-catalog-commit-bench \
-  --base-url http://127.0.0.1:8181/api/catalog \
-  --prefix my_catalog --token "$POLARIS_TOKEN" --create \
-  --iterations 2000 --concurrency 8
+catalog-commit-bench --base-url http://127.0.0.1:8181/catalog \
+  --location s3://warehouse/lakecat --idempotency $P
+```
+
+### Apache Nessie
+```sh
+catalog-commit-bench --base-url http://127.0.0.1:19120/iceberg --prefix main $P
 ```
 
 ### Apache Gravitino
-Gravitino exposes an Iceberg REST service; the prefix is the metalake/catalog
-route it is configured with. Bare commit path.
-
 ```sh
-catalog-commit-bench \
-  --base-url http://127.0.0.1:9001/iceberg \
-  --prefix "" --create \
-  --iterations 2000 --concurrency 8
+catalog-commit-bench --base-url http://127.0.0.1:9002/iceberg $P
+```
+
+### Apache Polaris
+OAuth2: bootstrap a root principal, exchange for a bearer token, pass it; the
+prefix is the catalog name.
+```sh
+catalog-commit-bench --base-url http://127.0.0.1:8185/api/catalog \
+  --prefix bench --token "$POLARIS_TOKEN" $P
 ```
 
 ### Unity Catalog (OSS)
-Unity exposes an Iceberg REST catalog surface; bare commit path, bearer token.
-Note: UC OSS has historically focused on Iceberg *reads* for external clients —
-confirm your build accepts external `updateTable` commits before trusting the
-write numbers.
-
+Bearer token, bare commit path. UC OSS has historically focused on Iceberg *reads*
+for external clients — confirm your build accepts external `updateTable` commits
+before trusting the write numbers.
 ```sh
-catalog-commit-bench \
-  --base-url http://127.0.0.1:8080/api/2.1/unity-catalog/iceberg \
-  --prefix unity --token "$UC_TOKEN" --create \
-  --iterations 2000 --concurrency 8
+catalog-commit-bench --base-url http://127.0.0.1:8080/api/2.1/unity-catalog/iceberg \
+  --prefix unity --token "$UC_TOKEN" $P
 ```
+
+## Bootstrap caveats (the externals are not turnkey)
+
+- **Polaris** bootstraps a root principal on first run and prints its
+  client_id/secret to the logs; exchange them via the OAuth2 token endpoint and
+  pass the result as `POLARIS_TOKEN`. Prefix = catalog name.
+- **Gravitino** uses the `apache/gravitino-iceberg-rest` image; confirm your tag
+  serves the REST API on the expected port (older tags differ).
+- **Unity (OSS)** verify it accepts external `updateTable` commits before trusting
+  write numbers.
 
 ## Fairness notes
 
-- `set-properties` + `assert-table-uuid` is the lowest-common-denominator commit
-  every conformant catalog accepts; it never writes data files, so the number is
-  catalog overhead, not storage throughput.
-- The concurrent phase measures commit *serialization* throughput. With
-  `set-properties` + `assert-table-uuid`, commits rarely conflict, so the
-  conflict rate mostly reflects how the catalog serializes pointer movement. A
-  future `--mode snapshot-append` would force genuine write-write conflicts.
+- `set-properties` is the lowest-common-denominator commit every conformant catalog
+  accepts; it writes no data files, so the number is **catalog overhead**, not
+  storage throughput.
+- **Sequential latency is the clean cross-catalog signal.** The concurrent column
+  reflects **commit-conflict policy** as much as speed: strict-CAS catalogs (LakeCat,
+  Nessie) show lower successful throughput under 8 writers to one table because most
+  commits correctly conflict and retry; permissive catalogs (Gravitino) show 0%.
 - Put the catalog and the driver on the same host/network for the latency phase;
   cross-AZ RTT will dominate otherwise.
 - `--idempotency` only affects catalogs that implement an idempotency key
   (LakeCat); others ignore the header.
 
+## Key flags
+
+| Flag | Meaning |
+|---|---|
+| `--base-url` | Up to and including any catalog-specific prefix path |
+| `--prefix` | Iceberg REST prefix segment (warehouse/catalog/metalake); may be empty |
+| `--location` | Explicit `createTable` location, e.g. `s3://warehouse/lakecat` (points writes at the shared MinIO) |
+| `--create` | Create the namespace + table before benchmarking |
+| `--idempotency` | Send a LakeCat-style `Idempotency-Key` per commit |
+| `--token` | Bearer token (`Authorization: Bearer ...`) |
+| `--iterations` / `--concurrency` / `--duration-secs` | Sequential count / concurrent writers / concurrent duration |
+| `--json` | Machine-readable summary |
+
 ## Conformance note (LakeCat)
 
-Building this benchmark surfaced two Iceberg REST conformance gaps in LakeCat,
-both since fixed: it only accepted `updateTable` at `.../tables/{table}/commit`
-(now also accepts the bare `POST .../tables/{table}`), and `createTable`
-required a client-supplied metadata document (now also accepts a standard schema
-and generates the metadata server-side). `--commit-suffix` therefore exists only
-for catalogs that might still mount commit on a sub-path; LakeCat no longer needs
-it.
+Building this benchmark surfaced two Iceberg REST conformance gaps in LakeCat, both
+since fixed: it only accepted `updateTable` at `.../tables/{table}/commit` (now also
+accepts the bare `POST .../tables/{table}`), and `createTable` required a
+client-supplied metadata document (now also accepts a standard schema and generates
+the metadata server-side). `--commit-suffix` therefore exists only for catalogs that
+might still mount commit on a sub-path; LakeCat no longer needs it.
