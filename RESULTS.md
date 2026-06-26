@@ -66,6 +66,49 @@ the Java catalogs; it was missing connection-reuse optimizations they had long m
 write a real `metadata.json` per commit — see History below; before that, the
 "303 /s, 0 objects" figure was the catalog doing no metadata work at all.)
 
+## Audit and Idempotency
+
+LakeCat's remaining ~13% sequential gap to Nessie (198 vs 228 commits/s) is **not a
+language gap — it is work the other catalogs do not do.** Every LakeCat commit runs
+**seven writes inside one transaction**:
+
+1. the metadata-pointer **compare-and-swap** (the actual commit),
+2. a **metadata-pointer log** row (the history of pointer movements),
+3. an **audit event** (who committed what, when),
+4. a **transactional-outbox** row — lineage/graph events staged *atomically* with
+   the commit and drained later, so a catalog change can never be lost or emitted
+   without the commit,
+5. an **idempotency record** — a retried commit with the same key replays the prior
+   result instead of double-applying,
+
+plus the namespace/table reads that validate the request. That is a durable audit
+trail + an atomic outbox + idempotency, fsynced to the embedded store, *per commit*.
+Nessie's version store and Gravitino's memory backend do less per commit because
+they offer less per commit. **LakeCat is paying for features, not losing on speed** —
+you would close the gap by relaxing those guarantees, not by changing languages.
+
+### Why "Rust" did not make it fast (and why that is fine)
+
+The commit path is **I/O-bound**, so the runtime's CPU speed is nearly irrelevant: a
+MinIO trace showed ~1 `PutObject`/commit at ~1.7 ms server-side, and LakeCat's own
+CPU + state work against *local* storage was p50 0.89 ms. A commit is a network PUT
+plus a durable transaction; "Rust is faster than Java" buys little when the hot path
+waits on S3 and fsync.
+
+What actually made LakeCat slow at first (12.6 ms p50) was **missing connection
+reuse** — rebuilding the S3 client and opening a new store connection on every commit
+— the boring pooling the JVM data ecosystem standardized decades ago, which a young
+Rust project simply had not done yet. Fixing it closed the gap (see *How LakeCat got
+here*). And a 1000-commit loop against a warm, long-running server is the **JVM's
+best case**: JIT-compiled hot paths and warm connection pools shine, while its real
+weaknesses — cold start and memory footprint — never appear.
+
+Where Rust still pays off is exactly what a warm steady-state benchmark hides: no GC
+pauses (steadier **tail latency**), a far smaller resident **footprint**, and instant
+**cold start** — which matter for serverless, edge, and many-tenant-per-host
+deployments. On median warm latency both runtimes converge because both are just
+waiting on S3; on tails, memory, and startup the Rust catalog keeps its edge.
+
 ## Notes on fairness
 
 - **Turso is LakeCat's catalog-state store, not table data.** It holds the
@@ -73,9 +116,9 @@ write a real `metadata.json` per commit — see History below; before that, the
   analogue of Polaris's metastore, Nessie's version store, and Gravitino's
   backend (all also local/in-memory here). The Iceberg `metadata.json` itself
   goes to S3/MinIO for every catalog, LakeCat included.
-- **LakeCat does 7 bookkeeping writes per commit** (pointer CAS + pointer log +
-  audit + outbox + idempotency) inside the commit transaction. That durability is
-  the bulk of the remaining ~14% sequential gap to Nessie's leaner version store.
+- **LakeCat does more durable bookkeeping per commit** (see *Audit and
+  Idempotency*) — the bulk of its remaining sequential gap to Nessie's leaner
+  version store.
 - **The concurrent column is commit-conflict policy, not speed.** Strict-CAS
   catalogs (LakeCat 73%, Nessie 81%) show lower successful throughput under 8
   writers to one table because most commits correctly conflict and retry.
