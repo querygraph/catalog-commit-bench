@@ -286,6 +286,112 @@ If Docker is unavailable the bench stays honest: it reports the Rust phases and
 marks the JVM phase **requires-container**, embedding the exact `run-spark.sh`
 recipe in its `notes` rather than fabricating a Spark number.
 
+# read-write results — INSERT + filtered-scan round-trip (and the LakeCat write gap it surfaces)
+
+`catalog-bench run read-write` (status **Ready**) is an **exploratory** end-to-end
+round-trip: it INSERTs real data through the live LakeCat Iceberg REST catalog +
+MinIO, then runs a filtered scan over it via Sail/DataFusion (cold vs warm Foyer
+cache). Its first job was to answer an open question honestly — *does a stock
+Iceberg client's write path actually work through LakeCat?* — and the answer is the
+most valuable output.
+
+## PHASE 0 — does stock-client Iceberg write work through LakeCat? **No — three gaps.**
+
+Probed with stock **pyiceberg 0.11.1** (`RestCatalog` + `table.append(arrow)`) and
+with raw REST. In order of where a stock write breaks:
+
+1. **`GET /v1/config` is unparseable by a stock client.** LakeCat serializes the
+   Iceberg `defaults`/`overrides` **map** fields as JSON **arrays** of `{key,value}`
+   (and `config: []` on load/create). pyiceberg's `ConfigResponse` requires objects,
+   so `RestCatalog(...)` raises a pydantic `dict_type` validation error **before the
+   first catalog call** — a stock client never even initializes. (This is the
+   long-standing LakeCat finding H8 / array-vs-object serialization.)
+2. **Non-canonical `endpoints` advertisement.** Past a config shim, pyiceberg's
+   endpoint-capability check rejects createTable because LakeCat advertises endpoint
+   strings with the `/catalog` base baked in and `{warehouse}` instead of the spec's
+   `{prefix}` (e.g. `POST /catalog/v1/{warehouse}/namespaces/{namespace}/tables`
+   rather than `POST /v1/{prefix}/namespaces/{namespace}/tables`).
+3. **The core blocker — a real snapshot APPEND is rejected by the catalog.** With a
+   response-rewriting shim past (1) and (2), `create_namespace` and `create_table`
+   succeed, but `table.append(arrow)` fails the commit:
+
+   ```
+   HTTP 400  LakeCatError: invalid argument: This feature is not implemented:
+   TableUpdate not yet supported by apply_table_updates: add-snapshot
+   ```
+
+   Crucially, pyiceberg had **already written the Parquet data file + the manifest +
+   the manifest-list to MinIO** before issuing the commit — verified by object
+   listing. So **the data plane works; only the catalog control-plane snapshot
+   registration is gated.** The Rust bench reproduces this gate directly over raw
+   REST (a minimal `add-snapshot` commit → the same HTTP 400), so the finding is
+   self-contained, no Python needed.
+
+**Conclusion / `requires-fix`:** a true Iceberg snapshot-append through LakeCat is
+gated in LakeCat/Sail — `apply_table_updates` needs to handle `add-snapshot` (and
+`set-snapshot-ref`). Until then, no stock Iceberg client can `INSERT` a queryable
+snapshot via LakeCat. (Spark's Iceberg `RestCatalog` would hit the same config break
+*and* the same `add-snapshot` gate, so it was not separately spun up — it adds no new
+information.) The diagnostic is reproducible: `crates/read-write/stock-append-probe.py`
+(run `SHIM=0` to see gap 1 raw, default to reach the `add-snapshot` gate).
+
+## What the bench therefore measures (all real, all live)
+
+Because the catalog rejects `add-snapshot`, the bench measures the INSERT LakeCat
+**does** accept, plus the Sail read over the resulting data — a genuine write→read
+round-trip on real data through real object storage:
+
+- **WRITE** — write N real Parquet data files (cache-scan column shape
+  `id i64, measure_a i64, measure_b f64, grp string`) to `s3://warehouse/read-write/`
+  via `object_store`, each paired with an **accepted LakeCat catalog commit**. Since
+  `add-snapshot` is gated, the accepted commit is a `set-properties` commit
+  (validation → a fresh **durable `metadata.json`** on S3 → the metadata-pointer
+  CAS) — verified: 16 metadata.json objects written, `snapshots = 0` (the gate).
+- **READ** — a filtered scan `WHERE measure_a > <median>` over those files via
+  **DataFusion** (the engine inside Sail), every byte routed through Sail's Foyer
+  `CachingObjectStore`, reported **no-cache** / **cold** / **warm**. This is the
+  *Rust-direct-files* path: it reads the data files directly, **not** via the catalog
+  planner (LakeCat holds no snapshot to plan — a consequence of the write gate).
+
+**Measured (live LakeCat 0.2.x + MinIO at `127.0.0.1`, 16 files × 200k rows =
+3.2 M rows / 86.9 MB; filter kept 1,600,533 rows ≈ 50%):**
+
+| phase | samples | p50 | p95 | throughput |
+|---|---|---|---|---|
+| data-write (Parquet → MinIO) | 16 files | **59.6 ms/file** | 76.6 ms | ~57 MB/s · 10.6 files/s |
+| catalog-commit (set-properties, accepted) | 16 | **5.8 ms** | 7.0 ms | — |
+| read-no-cache (raw S3) | 3 | **224.8 ms** | 231.3 ms | 7.1 M rows/s |
+| read-cold (fresh Foyer cache) | 1 | **550.8 ms** | — | 2.9 M rows/s |
+| read-warm (populated Foyer cache) | 5 | **3.5 ms** | 4.3 ms | 441 M rows/s |
+
+Reading *within* the run: the accepted **catalog commit p50 (5.8 ms)** matches the
+commit-path bench's LakeCat number (~5.3 ms) — the same set-properties machinery.
+The **filtered read** warms dramatically: **warm is ~150× faster than cold** and
+**~63× faster than no-cache** at p50 (cold pays the one-time cache fill, so cold >
+no-cache; warm then serves the whole filtered scan from Foyer RAM). As with the other
+read benches this is a **lower bound** — loopback MinIO has tiny per-request latency,
+so the cache win is far larger against remote S3.
+
+## Status
+
+`read-write` is **Ready**: a real write (data → MinIO + accepted, durable catalog
+commits) + real read (filtered Sail scan, cold/warm) round-trip runs and produces the
+numbers above. The headline *stock-client Iceberg snapshot-append* is **gated** at
+`apply_table_updates: add-snapshot` and that gap is surfaced front-and-centre in the
+bench's `notes` + PHASE-0 probe rather than papered over. When LakeCat/Sail land
+`add-snapshot` (+ `set-snapshot-ref`), the write phase can become a true Iceberg
+append and the read phase can route through the catalog's planner.
+
+Reproduce:
+
+```sh
+cd ~/src/catalog-bench
+cargo run -p catalog-bench-read-write --release            # direct
+cargo run -q -p catalog-bench -- run read-write --release  # via the driver
+# knobs: --files --rows --row-group --no-cache-iters --warm-iters --namespace --table --prefix
+# stock-client diagnostic (optional venv): see crates/read-write/stock-append-probe.py
+```
+
 ## Reproduce
 
 ```sh

@@ -3,7 +3,7 @@ name = "catalog-bench-read-write"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Full INSERT + filtered-scan workload through LakeCat + Sail — SCAFFOLD."
+description = "Full INSERT + filtered-scan round-trip through LakeCat + Sail (write data -> MinIO + catalog commit, then a filtered Sail/DataFusion scan cold/warm)."
 
 [[bin]]
 name = "catalog-bench-read-write"
@@ -12,4 +12,42 @@ path = "src/main.rs"
 [dependencies]
 catalog-bench-common = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+# The LakeCat Iceberg REST commit + the stock-append probe go over plain REST.
+reqwest = { workspace = true }
+futures = "0.3"
+url = "2"
+
+# Sail's Foyer object-store cache, by PATH on the feat/object-store-foyer-cache
+# branch — so the read phase serves bytes from the same CachingObjectStore that
+# `cache-scan` / `rust-vs-jvm` use. `default-features = false` skips Sail's `hdfs`.
+sail-object-store = { path = "../../../sail/crates/sail-object-store", default-features = false }
+
+# DataFusion is the engine inside Sail; this is a real Sail-path read.
+# These MUST resolve to the SAME versions `cache-scan` / `rust-vs-jvm` /
+# `sail-object-store` use, so the write (ArrowWriter + object_store PUT) and the
+# read (DataFusion over CachingObjectStore) share ONE `object_store`/`arrow`.
+# Pinned from ~/src/sail/Cargo.lock: datafusion 54.0.0, object_store 0.13.2,
+# parquet/arrow 58.3.0. The datafusion feature list MIRRORS Sail's own (no `sql`
+# feature: Sail's transitive datafusion-common lacks the sqlparser error variant,
+# so the query is built via the DataFrame API, not `ctx.sql()`).
+datafusion = { version = "54.0.0", default-features = false, features = [
+    "nested_expressions",
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "compression",
+    "parquet",
+    "serde",
+    "avro",
+    "recursive_protection",
+] }
+object_store = { version = "0.13.2", features = ["aws"] }
+parquet = { version = "58.3.0", features = ["async", "object_store"] }
+arrow = "58.3.0"

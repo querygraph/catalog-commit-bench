@@ -60,8 +60,10 @@ const BENCHES: &[BenchSpec] = &[
     BenchSpec {
         name: "read-write",
         package: "catalog-bench-read-write",
-        status: BenchStatus::Scaffold,
-        description: "Full INSERT + filtered-scan workload through LakeCat + Sail (scaffold).",
+        status: BenchStatus::Ready,
+        description: "INSERT (real Parquet data -> MinIO + accepted LakeCat commit) + filtered \
+Sail/DataFusion scan cold/warm round-trip; surfaces the catalog's stock-append gap \
+(apply_table_updates: add-snapshot) — see notes.",
     },
 ];
 

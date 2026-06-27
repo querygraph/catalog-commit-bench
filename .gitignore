@@ -1,3 +1,7 @@
 target
 .linux-target
 docker/lakecat/lakecat-service
+
+# Python venv for the read-write bench's stock-client (pyiceberg) probe.
+.venv
+crates/read-write/.venv
