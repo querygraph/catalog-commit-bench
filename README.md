@@ -11,14 +11,25 @@ object-store cache) is meant to shine.
 
 | Name | Status | What it measures |
 | --- | --- | --- |
-| `commit` | **ready** | Iceberg REST **commit-path** latency + throughput across catalogs — the impartial, catalog-only comparison (detailed below). |
+| `commit` | **ready** | Iceberg REST **commit-path** latency + throughput across catalogs — the impartial, catalog-only comparison (detailed below). LakeCat lands **#2 of 4** (vs Nessie/Gravitino/Polaris). |
 | `write-data` | **ready** | Realistic **writes**: a real Parquet data file → the same MinIO bucket, then a LakeCat commit. Write throughput under realistic payloads. |
-| `cache-scan` | scaffold | **Cold vs warm scan** via Sail + the [Foyer object-store cache](https://github.com/lakehq/sail/issues/1015): S3 miss vs local cache hit. *(needs the cache landing)* |
-| `rust-vs-jvm` | scaffold | **Sail (Rust) vs Spark/Trino (JVM)** scanning the same Iceberg tables with predicates (pruning). *(needs a JVM engine in the stack)* |
-| `read-write` | scaffold | Full **INSERT + filtered-scan** workload through LakeCat + Sail. *(needs Sail write-path wiring)* |
+| `cache-scan` | **ready** | **Cold vs warm Parquet scan** via Sail's [Foyer object-store cache](https://github.com/lakehq/sail/issues/1015): measured **~26×** warm-vs-cold (per-file p50 warm 1.81 ms vs cold/no-cache ~47.5 ms; 87 MB dataset). |
+| `rust-vs-jvm` | **ready** | **Sail/DataFusion (Rust) vs Apache Spark 3.5.3 (JVM)**, same query/files/MinIO: **1.63×** engine edge with no local cache (Rust 446 ms vs Spark-warm 729 ms p50), **57.5×** with the warm Foyer cache. |
+| `read-write` | **ready** | A **proven stock-client Iceberg round-trip**: a raw pyiceberg 0.11.1 `RestCatalog` (no shim) does init → create_table → `table.append` (a real snapshot) → scan back 1000 rows through LakeCat — plus the Foyer read path (read-warm ~150× cold). |
 
-The scaffolds compile and self-document their prerequisite; each becomes runnable
-as its dependency lands (`cache-scan` first, once the Foyer cache merges).
+All five run against the shared MinIO harness and emit a JSON `BenchReport`; see
+**[RESULTS.md](RESULTS.md)** for the full measured numbers and methodology.
+
+**Honest framing on `rust-vs-jvm`:** the 1.63× is the engine edge with no local
+cache; the 57.5× is the warm RAM (Foyer) cache, not engine speed — and a warm
+steady-state loop is the JVM's *best* case. `read-write` runs on a `sail-local`
+LakeCat; the default build honestly rejects the write (finding H9).
+
+The suite's read-path work also **surfaced and then validated** the five fixes that
+made stock Iceberg writes work end-to-end — LakeCat's **H8** config-as-objects +
+canonical endpoints + **listTables** + **H9**, and Sail's add-snapshot in
+`apply_table_updates` — landed across `querygraph/lakecat` and
+`querygraph/sail#lakecat`. (Details in [RESULTS.md](RESULTS.md) → *read-write*.)
 
 ## The driver
 
@@ -28,8 +39,8 @@ cargo run -p catalog-bench -- run commit -- ...     # run one (args after -- pas
 cargo run -p catalog-bench -- run all               # run all ready benchmarks, aggregate reports
 ```
 
-Each benchmark emits a JSON `BenchReport` that the driver aggregates; pass
-`--include-scaffold` to attempt the not-yet-wired ones.
+Each benchmark emits a JSON `BenchReport` that the driver aggregates; `run all`
+runs all five.
 
 See **[RESULTS.md](RESULTS.md)** for measured results.
 
