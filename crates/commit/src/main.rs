@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use catalog_bench_common::{BenchReport, BenchStatus, Phase};
 use clap::Parser;
 use serde_json::{json, Value};
 
@@ -128,7 +129,11 @@ impl Catalog {
         if resp.status().is_success() || resp.status().as_u16() == 409 {
             return Ok(());
         }
-        bail!("create namespace failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        bail!(
+            "create namespace failed: {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
     }
 
     async fn create_table(&self, ns: &str, table: &str) -> Result<()> {
@@ -156,7 +161,11 @@ impl Catalog {
         if resp.status().is_success() || resp.status().as_u16() == 409 {
             return Ok(());
         }
-        bail!("create table failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        bail!(
+            "create table failed: {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
     }
 
     async fn load_table_uuid(&self, ns: &str, table: &str) -> Result<String> {
@@ -166,7 +175,11 @@ impl Catalog {
             .await
             .context("loadTable request")?;
         if !resp.status().is_success() {
-            bail!("loadTable failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+            bail!(
+                "loadTable failed: {} {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
         }
         let v: Value = resp.json().await?;
         v.pointer("/metadata/table-uuid")
@@ -177,7 +190,14 @@ impl Catalog {
 
     /// Issue one set-properties commit. Returns Ok(true) on success, Ok(false)
     /// on a 409 commit conflict, Err on anything else.
-    async fn commit(&self, ns: &str, table: &str, uuid: &str, counter: u64, idem: bool) -> Result<bool> {
+    async fn commit(
+        &self,
+        ns: &str,
+        table: &str,
+        uuid: &str,
+        counter: u64,
+        idem: bool,
+    ) -> Result<bool> {
         let body = json!({
             "requirements": [{"type": "assert-table-uuid", "uuid": uuid}],
             "updates": [{
@@ -197,7 +217,11 @@ impl Catalog {
         } else if status == 409 {
             Ok(false)
         } else {
-            bail!("commit failed: {} {}", status, resp.text().await.unwrap_or_default());
+            bail!(
+                "commit failed: {} {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            );
         }
     }
 }
@@ -214,7 +238,9 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let cat = Arc::new(Catalog {
-        http: reqwest::Client::builder().pool_max_idle_per_host(64).build()?,
+        http: reqwest::Client::builder()
+            .pool_max_idle_per_host(64)
+            .build()?,
         base_url: args.base_url.clone(),
         prefix: args.prefix.clone(),
         token: args.token.clone(),
@@ -230,7 +256,14 @@ async fn main() -> Result<()> {
 
     // Warmup.
     for i in 0..args.warmup {
-        cat.commit(&args.namespace, &args.table, &uuid, 1_000_000 + i, args.idempotency).await?;
+        cat.commit(
+            &args.namespace,
+            &args.table,
+            &uuid,
+            1_000_000 + i,
+            args.idempotency,
+        )
+        .await?;
     }
 
     // --- Sequential latency phase ---
@@ -238,7 +271,8 @@ async fn main() -> Result<()> {
     let seq_start = Instant::now();
     for i in 0..args.iterations {
         let t = Instant::now();
-        cat.commit(&args.namespace, &args.table, &uuid, i, args.idempotency).await?;
+        cat.commit(&args.namespace, &args.table, &uuid, i, args.idempotency)
+            .await?;
         lat_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let seq_elapsed = seq_start.elapsed().as_secs_f64();
@@ -253,7 +287,12 @@ async fn main() -> Result<()> {
     let conc_start = Instant::now();
     let mut handles = Vec::new();
     for w in 0..args.concurrency {
-        let (cat, ns, table, uuid) = (cat.clone(), args.namespace.clone(), args.table.clone(), uuid.clone());
+        let (cat, ns, table, uuid) = (
+            cat.clone(),
+            args.namespace.clone(),
+            args.table.clone(),
+            uuid.clone(),
+        );
         let (ok, conflict) = (ok.clone(), conflict.clone());
         let idem = args.idempotency;
         handles.push(tokio::spawn(async move {
@@ -261,8 +300,12 @@ async fn main() -> Result<()> {
             while Instant::now() < deadline {
                 n += 1;
                 match cat.commit(&ns, &table, &uuid, n, idem).await {
-                    Ok(true) => { ok.fetch_add(1, Ordering::Relaxed); }
-                    Ok(false) => { conflict.fetch_add(1, Ordering::Relaxed); }
+                    Ok(true) => {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(false) => {
+                        conflict.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(_) => { /* transient; keep going */ }
                 }
             }
@@ -282,6 +325,8 @@ async fn main() -> Result<()> {
         0.0
     };
 
+    // Human-readable / legacy-JSON output goes to STDERR so that stdout carries
+    // only the machine-readable `BenchReport` the driver consumes.
     if args.json {
         let out = json!({
             "target": { "base_url": args.base_url, "prefix": args.prefix,
@@ -306,23 +351,75 @@ async fn main() -> Result<()> {
                 "conflict_rate": conflict_rate,
             }
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        eprintln!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("catalog-commit-bench  ->  {}  (prefix='{}', table={}/{})",
-            args.base_url, args.prefix, args.namespace, args.table);
-        println!("  idempotency header: {}", args.idempotency);
-        println!();
-        println!("Sequential commit latency ({} commits):", args.iterations);
-        println!("  throughput : {:>8.1} commits/s", seq_throughput);
-        println!("  p50        : {:>8.3} ms", percentile(&lat_ms, 50.0));
-        println!("  p90        : {:>8.3} ms", percentile(&lat_ms, 90.0));
-        println!("  p99        : {:>8.3} ms", percentile(&lat_ms, 99.0));
-        println!("  max        : {:>8.3} ms", lat_ms.last().copied().unwrap_or(0.0));
-        println!();
-        println!("Concurrent throughput ({} writers, {:.1}s):", args.concurrency, conc_elapsed);
-        println!("  committed  : {ok_n}");
-        println!("  conflicts  : {conflict_n}  (rate {:.2}%)", conflict_rate * 100.0);
-        println!("  throughput : {:>8.1} commits/s", conc_throughput);
+        eprintln!(
+            "catalog-bench-commit  ->  {}  (prefix='{}', table={}/{})",
+            args.base_url, args.prefix, args.namespace, args.table
+        );
+        eprintln!("  idempotency header: {}", args.idempotency);
+        eprintln!();
+        eprintln!("Sequential commit latency ({} commits):", args.iterations);
+        eprintln!("  throughput : {:>8.1} commits/s", seq_throughput);
+        eprintln!("  p50        : {:>8.3} ms", percentile(&lat_ms, 50.0));
+        eprintln!("  p90        : {:>8.3} ms", percentile(&lat_ms, 90.0));
+        eprintln!("  p99        : {:>8.3} ms", percentile(&lat_ms, 99.0));
+        eprintln!(
+            "  max        : {:>8.3} ms",
+            lat_ms.last().copied().unwrap_or(0.0)
+        );
+        eprintln!();
+        eprintln!(
+            "Concurrent throughput ({} writers, {:.1}s):",
+            args.concurrency, conc_elapsed
+        );
+        eprintln!("  committed  : {ok_n}");
+        eprintln!(
+            "  conflicts  : {conflict_n}  (rate {:.2}%)",
+            conflict_rate * 100.0
+        );
+        eprintln!("  throughput : {:>8.1} commits/s", conc_throughput);
     }
+
+    // Machine-readable suite report -> STDOUT (read by the `catalog-bench` driver).
+    let report = BenchReport {
+        name: "commit".to_string(),
+        status: BenchStatus::Ready,
+        phases: vec![
+            Phase {
+                name: "sequential".to_string(),
+                samples: args.iterations,
+                p50_ms: percentile(&lat_ms, 50.0),
+                p95_ms: percentile(&lat_ms, 95.0),
+                throughput_per_s: seq_throughput,
+                extra: Some(json!({
+                    "p90_ms": percentile(&lat_ms, 90.0),
+                    "p99_ms": percentile(&lat_ms, 99.0),
+                    "max_ms": lat_ms.last().copied().unwrap_or(0.0),
+                })),
+            },
+            Phase {
+                name: "concurrent".to_string(),
+                samples: ok_n,
+                // The concurrent phase measures aggregate throughput, not
+                // per-commit latency, so the latency fields are left at 0.
+                p50_ms: 0.0,
+                p95_ms: 0.0,
+                throughput_per_s: conc_throughput,
+                extra: Some(json!({
+                    "writers": args.concurrency,
+                    "duration_secs": conc_elapsed,
+                    "ok": ok_n,
+                    "conflicts": conflict_n,
+                    "conflict_rate": conflict_rate,
+                })),
+            },
+        ],
+        notes: Some(format!(
+            "set-properties commits against {} (prefix='{}', table={}/{}); idempotency={}",
+            args.base_url, args.prefix, args.namespace, args.table, args.idempotency
+        )),
+    };
+    report.print_stdout();
     Ok(())
 }

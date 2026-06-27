@@ -1,14 +1,28 @@
-[package]
-name = "catalog-commit-bench"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Iceberg REST catalog commit-path benchmark (LakeCat, Polaris, Gravitino, Unity)"
 license = "Apache-2.0"
+repository = "https://github.com/querygraph/catalog-bench"
 
-[dependencies]
+# Shared dependency versions. Individual crates opt in via `{ workspace = true }`,
+# so the suite pins one version of each dep in one place.
+[workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# Real data-write path (write-data bench only). Kept out of the other crates so the
+# default workspace build stays light.
+arrow = "54"
+parquet = "54"
+object_store = { version = "0.11", features = ["aws"] }
+
+# The shared library, consumed by every bench + the driver.
+catalog-bench-common = { path = "crates/common" }

@@ -1,0 +1,15 @@
+[package]
+name = "catalog-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Driver for the catalog-bench suite: list and run the benchmarks, aggregate reports."
+
+[[bin]]
+name = "catalog-bench"
+path = "src/main.rs"
+
+[dependencies]
+catalog-bench-common = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }

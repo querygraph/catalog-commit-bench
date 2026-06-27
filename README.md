@@ -1,20 +1,54 @@
-# catalog-commit-bench
+# catalog-bench
+
+A benchmark **suite** for Iceberg REST catalogs and the Rust data path around
+them — built on one shared, impartial MinIO/S3 harness and driven by a single
+`catalog-bench` CLI. It began as a commit-path comparison (LakeCat vs Apache
+Nessie / Gravitino / Polaris) and now spans the read and write paths where a Rust
+stack (LakeCat + [Sail](https://github.com/lakehq/sail), with the Foyer
+object-store cache) is meant to shine.
+
+## Benchmarks
+
+| Name | Status | What it measures |
+| --- | --- | --- |
+| `commit` | **ready** | Iceberg REST **commit-path** latency + throughput across catalogs — the impartial, catalog-only comparison (detailed below). |
+| `write-data` | **ready** | Realistic **writes**: a real Parquet data file → the same MinIO bucket, then a LakeCat commit. Write throughput under realistic payloads. |
+| `cache-scan` | scaffold | **Cold vs warm scan** via Sail + the [Foyer object-store cache](https://github.com/lakehq/sail/issues/1015): S3 miss vs local cache hit. *(needs the cache landing)* |
+| `rust-vs-jvm` | scaffold | **Sail (Rust) vs Spark/Trino (JVM)** scanning the same Iceberg tables with predicates (pruning). *(needs a JVM engine in the stack)* |
+| `read-write` | scaffold | Full **INSERT + filtered-scan** workload through LakeCat + Sail. *(needs Sail write-path wiring)* |
+
+The scaffolds compile and self-document their prerequisite; each becomes runnable
+as its dependency lands (`cache-scan` first, once the Foyer cache merges).
+
+## The driver
+
+```sh
+cargo run -p catalog-bench -- list                 # list benchmarks + status
+cargo run -p catalog-bench -- run commit -- ...     # run one (args after -- pass to the bench)
+cargo run -p catalog-bench -- run all               # run all ready benchmarks, aggregate reports
+```
+
+Each benchmark emits a JSON `BenchReport` that the driver aggregates; pass
+`--include-scaffold` to attempt the not-yet-wired ones.
+
+See **[RESULTS.md](RESULTS.md)** for measured results.
+
+## The commit benchmark
 
 A catalog-agnostic benchmark for the **commit path** of Iceberg REST catalogs —
-measured here across **LakeCat, Apache Nessie, Apache Gravitino, and Apache
-Polaris**. (Unity Catalog OSS is *not yet measurable*: its Iceberg REST endpoint is
-read-only until the commit endpoints in PR #1618 / 0.6.0 ship — see
-[RESULTS.md](RESULTS.md) → "Not measured".)
+measured across **LakeCat, Apache Nessie, Apache Gravitino, and Apache Polaris**.
+(Unity Catalog OSS is *not yet measurable*: its Iceberg REST endpoint is read-only
+until the commit endpoints in PR #1618 / 0.6.0 ship — see [RESULTS.md](RESULTS.md)
+→ "Not measured".)
 
-TPC-DS/TPC-H measure query engines; they touch the catalog only incidentally. This
-driver isolates the part those benchmarks ignore: the catalog **commit transaction**
-— update validation, writing the new `metadata.json`, the metadata-pointer
-compare-and-swap, and durable persistence. It issues `set-properties` commits (no
-data files), so each request exercises the catalog's commit machinery without
-engine or data-write noise. Every target speaks the same Iceberg REST protocol, so
-one binary benchmarks all of them; only the base URL, prefix, and auth differ.
-
-See **[RESULTS.md](RESULTS.md)** for a measured cross-catalog comparison.
+TPC-DS/TPC-H measure query engines; they touch the catalog only incidentally. The
+`commit` benchmark isolates the part those benchmarks ignore: the catalog **commit
+transaction** — update validation, writing the new `metadata.json`, the
+metadata-pointer compare-and-swap, and durable persistence. It issues
+`set-properties` commits (no data files), so each request exercises the catalog's
+commit machinery without engine or data-write noise. Every target speaks the same
+Iceberg REST protocol, so one binary benchmarks all of them; only the base URL,
+prefix, and auth differ.
 
 ## What it measures
 
