@@ -52,8 +52,10 @@ const BENCHES: &[BenchSpec] = &[
     BenchSpec {
         name: "rust-vs-jvm",
         package: "catalog-bench-rust-vs-jvm",
-        status: BenchStatus::Scaffold,
-        description: "Sail (Rust) vs Spark/Trino (JVM) Iceberg scan with pruning (scaffold).",
+        status: BenchStatus::Ready,
+        description:
+            "Sail/DataFusion (Rust) vs Spark (JVM): same filter+aggregate over same MinIO Parquet \
+(Spark phase needs Docker; falls back to Rust-only + container recipe otherwise).",
     },
     BenchSpec {
         name: "read-write",

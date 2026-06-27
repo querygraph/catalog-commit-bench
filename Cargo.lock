@@ -1349,9 +1349,17 @@ dependencies = [
 name = "catalog-bench-rust-vs-jvm"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arrow 58.3.0",
  "catalog-bench-common",
  "clap",
+ "datafusion",
+ "object_store 0.13.2",
+ "sail-object-store",
+ "serde",
  "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

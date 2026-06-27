@@ -198,6 +198,94 @@ cargo run -q -p catalog-bench -- run cache-scan --release   # via the driver
 # knobs: --files --rows --row-group --no-cache-iters --warm-iters --rewrite
 ```
 
+# rust-vs-jvm results — Sail/DataFusion (Rust) vs Spark (JVM)
+
+A real **engine-vs-engine** read comparison (`catalog-bench run rust-vs-jvm`,
+status **Ready**): **Sail's engine, DataFusion (Rust)**, vs **Apache Spark 3.5.3
+(JVM)**, running the *same* filter+aggregate over the *same* Parquet files in the
+*same* MinIO. Both engines scanned **3,200,000 rows into 8 groups** — verified equal
+on both sides, so this is genuinely the identical query over identical bytes.
+
+**The query (identical on both engines):**
+
+```sql
+SELECT grp, count(*) AS n, sum(measure_a) AS s1, avg(measure_b) AS a2
+FROM cache_scan WHERE measure_a > 0 GROUP BY grp ORDER BY grp
+```
+
+It reuses the **cache-scan dataset** (`s3://warehouse/cache-scan/`, 16 Parquet ×
+200k rows, ~87 MB). `measure_a` is always `>= 0`, so `measure_a > 0` keeps ~every
+row: the query is **scan-bound**, not pruning-bound — it stresses scan + aggregate,
+not predicate selectivity.
+
+- **Rust side** — **DataFusion 54.0.0** (the engine inside Sail) registers the
+  Parquet directory over `object_store` and runs the query via the DataFrame API.
+  It shares **one** `object_store 0.13.2` (+ `parquet`/`arrow 58.3.0`) with Sail's
+  `CachingObjectStore`, so the same Foyer cache used by `cache-scan` serves the warm
+  phase. (DataFusion's SQL frontend is feature-disabled to mirror Sail's exact
+  datafusion feature set; the DataFrame plan is logically identical to the SQL.)
+- **JVM side** — Spark reads `s3a://warehouse/cache-scan/` via the Hadoop S3A
+  connector (`hadoop-aws:3.3.4` + `aws-java-sdk-bundle:1.12.262`, path-style, SSL
+  off, `SimpleAWSCredentialsProvider`), reaching the host MinIO at
+  `host.docker.internal:9000` from an `apache/spark:3.5.3` container. The query runs
+  **N+1× in one long-lived session**; JVM startup + JIT + the cold first run are
+  **discarded**, and the **warm steady-state** median/p95 is reported — the JVM's
+  best case.
+
+**Measured (live MinIO at `127.0.0.1:9000`; whole-query p50/p95):**
+
+| phase | what | p50 | p95 | vs Spark-warm |
+|---|---|---|---|---|
+| **jvm-warm** | Spark 3.5.3, steady-state warm (S3A, no local cache) | **728.6 ms** | 889.0 ms | 1.00× (baseline) |
+| **rust-no-cache** | DataFusion over raw MinIO (no local cache) | **446.1 ms** | 575.8 ms | **1.63× faster** |
+| **rust-cold** | DataFusion, fresh Foyer cache (fills from MinIO) | **545.1 ms** | 545.1 ms | **1.34× faster** |
+| **rust-warm** | DataFusion, warm Foyer cache (RAM hits) | **12.7 ms** | 14.4 ms | **57.5× faster** |
+
+**The honest engine-to-engine number is rust-no-cache vs jvm-warm:** both re-read
+every Parquet byte from MinIO on each query with **no local byte cache**, isolating
+scan+aggregate efficiency. There DataFusion is **~1.63× faster** than Spark-warm —
+a real but modest edge; the query is largely network-bound (87 MB over loopback
+S3/S3A each run), and Spark also pays per-file task scheduling + S3A overhead.
+
+**`rust-warm`'s 57× is NOT a language win** — it is Sail's Foyer object-store byte
+cache (served from local RAM), which this Spark setup has **no equivalent of**
+(Spark re-reads S3 on every query). Read it as *Sail-with-its-cache vs
+Spark-without-one*. It mirrors the cache-scan result: the Foyer layer, not the
+runtime, collapses the latency.
+
+## Why the warm numbers look the way they do (fairness)
+
+This mirrors the framing in *"Why Rust did not make it fast"* above. A warm,
+long-lived, steady-state query is the **JVM's best case**: JIT-compiled hot paths
+and warm connection pools shine, while the JVM's real weaknesses — **cold start**
+and **memory footprint** — never appear (we deliberately excluded JVM startup, JIT
+warmup, and the cold first scan from `jvm-warm`). On the apples-to-apples
+no-cache scan both engines are mostly **waiting on the same 87 MB of S3 bytes**, so
+DataFusion's 1.63× is a moderate scan-efficiency edge, not an order-of-magnitude
+"Rust beats Java." Where Rust keeps a durable advantage is exactly what a warm
+steady-state hides: **no GC pauses** (steadier tail latency), a far smaller
+**resident footprint**, and **instant cold start** — the JVM startup + warmup we
+discarded here is real cost in serverless / edge / many-tenant-per-host deployments.
+And on a **local loopback MinIO** the network term is tiny; against remote S3 both
+cold numbers grow and the Foyer-cache (`rust-warm`) advantage grows much larger.
+
+Reproduce:
+
+```sh
+cd ~/src/catalog-bench
+# Rust phases only (no Docker needed):
+cargo run -p catalog-bench-rust-vs-jvm --release -- --skip-jvm
+# Full head-to-head (needs Docker; first run downloads hadoop-aws via --packages):
+cargo run -q -p catalog-bench -- run rust-vs-jvm --release
+# JVM phase alone (debug / container recipe):
+S3_ENDPOINT=http://host.docker.internal:9000 S3_PATH=s3a://warehouse/cache-scan/ \
+  crates/rust-vs-jvm/run-spark.sh
+```
+
+If Docker is unavailable the bench stays honest: it reports the Rust phases and
+marks the JVM phase **requires-container**, embedding the exact `run-spark.sh`
+recipe in its `notes` rather than fabricating a Spark number.
+
 ## Reproduce
 
 ```sh
