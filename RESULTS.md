@@ -14,28 +14,32 @@ counts).
 
 | Catalog | Storage | Seq throughput | Seq p50 | Seq p99 | Concurrent (8w) | Conflict rate |
 |---|---|---|---|---|---|---|
-| **Nessie** 0.107.5 | MinIO / S3 | 228.6 /s | 4.04 ms | 8.4 ms | 164.0 /s | 81.6% |
-| **LakeCat** 0.2.0 | MinIO / S3 (Turso state) | 198.2 /s | 4.52 ms | 10.7 ms | 311.6 /s | 73.7% |
-| **Gravitino** (iceberg-rest) | MinIO / S3 | 163.9 /s | 5.74 ms | 11.2 ms | 340.2 /s | 0% |
-| **Polaris** 1.5.0 | MinIO / S3 | 97.6 /s | 9.81 ms | 16.9 ms | 91.5 /s | 5.78% |
+| **Nessie** 0.107.5 | MinIO / S3 | 170.6 /s | 4.87 ms | 16.2 ms | 136.3 /s | 82.1% |
+| **LakeCat** 0.2.1 | MinIO / S3 (Turso state) | 148.6 /s | 5.34 ms | 21.2 ms | 288.0 /s | 70.2% |
+| **Gravitino** (iceberg-rest) | MinIO / S3 | 132.4 /s | 6.34 ms | 19.7 ms | 272.6 /s | 0% |
+| **Polaris** 1.5.0 | MinIO / S3 | 84.0 /s | 10.40 ms | 30.3 ms | 61.5 /s | 7.5% |
 
 (All four in one `bench-stack.sh` sweep; Polaris is auto-bootstrapped — an OAuth2
 token + an S3 catalog on the same `warehouse` bucket — by `polaris-bootstrap.sh`.)
 
-**LakeCat 0.2.0 is now competitive with the mature Java catalogs — #2 on both
-axes.** Its commit p50 (4.52 ms) is *faster* than Gravitino (5.74 ms) and Polaris
-(9.81 ms) and within ~13% of Nessie (4.04 ms); on concurrent throughput it is **#2**
-(312 /s, behind Gravitino's 340, ~1.9× Nessie). That is a large change from 0.1.1,
-where LakeCat's commit p50 was 9.9 ms and its concurrent throughput was the worst of
-the field (38.5 /s).
+**LakeCat 0.2.1 is competitive with the mature Java catalogs — #2 on sequential
+latency and #1 on concurrent throughput.** Its commit p50 (5.34 ms) is *faster* than
+Gravitino (6.34 ms) and Polaris (10.40 ms) and within ~10% of Nessie (4.87 ms); on
+concurrent throughput it is **first** (288 /s, just ahead of Gravitino's 273 and
+~2.1× Nessie). That is a large change from 0.1.1, where LakeCat's commit p50 was
+~2× worse and its concurrent throughput was the worst of the field (38.5 /s).
 
 The concurrent column reflects **commit-conflict policy** as much as raw speed:
-LakeCat (74%) and Nessie (82%) enforce strict optimistic concurrency — 8 writers to
+LakeCat (70%) and Nessie (82%) enforce strict optimistic concurrency — 8 writers to
 the *same* table mostly conflict and retry, so successful throughput is held down by
-design — while Gravitino (0%) and Polaris (6%) accept concurrent `set-properties`
-more permissively. **Polaris is the heaviest per commit** (9.81 ms p50) owing to
-RBAC checks + credential subscoping on top of the S3 write — that is governance
-cost, not inefficiency.
+design — while Gravitino (0%) and Polaris (8%) accept concurrent `set-properties`
+more permissively. (LakeCat leads the concurrent column *despite* a strict-CAS
+policy: all 8 writers hit the same table, so its edge is cheap conflict detection +
+a fast bounded retry loop, not parallelism — the losers retry quickly and the
+winners commit fast.)
+**Polaris is the heaviest per commit** (10.40 ms p50) owing to RBAC checks +
+credential subscoping on top of the S3 write — that is governance cost, not
+inefficiency.
 
 ## How LakeCat got here (0.1.1 → 0.2.0)
 
@@ -68,7 +72,7 @@ write a real `metadata.json` per commit — see History below; before that, the
 
 ## Audit and Idempotency
 
-LakeCat's remaining ~13% sequential gap to Nessie (198 vs 228 commits/s) is **not a
+LakeCat's remaining ~13% sequential gap to Nessie (149 vs 171 commits/s) is **not a
 language gap — it is work the other catalogs do not do.** Every LakeCat commit runs
 **seven writes inside one transaction**:
 
@@ -120,8 +124,9 @@ waiting on S3; on tails, memory, and startup the Rust catalog keeps its edge.
   Idempotency*) — the bulk of its remaining sequential gap to Nessie's leaner
   version store.
 - **The concurrent column is commit-conflict policy, not speed.** Strict-CAS
-  catalogs (LakeCat 73%, Nessie 81%) show lower successful throughput under 8
-  writers to one table because most commits correctly conflict and retry.
+  catalogs (LakeCat 70%, Nessie 82%) both retry most of their 8-writer commits;
+  LakeCat still leads the column because its conflict detection and bounded retry
+  are cheap, so it churns through successful same-table commits faster.
 
 ## History: why the first LakeCat run was wrong (303 /s, 0 objects)
 
@@ -161,5 +166,14 @@ same `warehouse` bucket); set `POLARIS_TOKEN` to skip the bootstrap.
 
 ## Not measured
 
-- **Unity OSS** is not in `~/src/boat`'s compose; its external-`updateTable`
-  write support needs confirming before a write benchmark is meaningful.
+- **Unity Catalog OSS** — *cannot* be benchmarked on the commit path yet. Released
+  Unity OSS (latest **0.5.0**) exposes its Iceberg REST endpoint
+  (`/api/2.1/unity-catalog/iceberg`) as **read-only** — it has no external
+  `updateTable` / `set-properties` commit handler, so there is nothing to measure on
+  this benchmark's axis. Commit support is implemented only in **unmerged draft PR
+  [#1618](https://github.com/unitycatalog/unitycatalog/pull/1618)** ("Implement
+  Iceberg REST catalog write endpoints"), targeting an unreleased **0.6.0**. To
+  include Unity, build the image from that branch (or wait for a 0.6.0 release) and
+  add it to `bench-stack.sh`; the compose file already carries a `unity` profile for
+  when that lands. (Databricks-hosted Unity Catalog has Iceberg REST writes, but that
+  is a separate product, not the Docker-deployable OSS server.)

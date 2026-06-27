@@ -1,7 +1,10 @@
 # catalog-commit-bench
 
 A catalog-agnostic benchmark for the **commit path** of Iceberg REST catalogs —
-**LakeCat, Apache Polaris, Apache Gravitino, Apache Nessie, and Unity Catalog**.
+measured here across **LakeCat, Apache Nessie, Apache Gravitino, and Apache
+Polaris**. (Unity Catalog OSS is *not yet measurable*: its Iceberg REST endpoint is
+read-only until the commit endpoints in PR #1618 / 0.6.0 ship — see
+[RESULTS.md](RESULTS.md) → "Not measured".)
 
 TPC-DS/TPC-H measure query engines; they touch the catalog only incidentally. This
 driver isolates the part those benchmarks ignore: the catalog **commit transaction**
@@ -137,9 +140,9 @@ services:
     environment:
       GRAVITINO_ICEBERG_REST_CATALOG_BACKEND: memory
       GRAVITINO_ICEBERG_REST_CATALOG_WAREHOUSE: /tmp/gravitino-warehouse
-  unitycatalog:                  # docker compose --profile unity up -d unitycatalog
-    image: unitycatalog/unitycatalog:latest
-    ports: ["8080:8080"]
+  unitycatalog:                  # read-only Iceberg REST until PR #1618 / 0.6.0
+    image: unitycatalog/unitycatalog:0.5.0
+    ports: ["8080:8080"]         # server 8080 (UI 3000); not in the comparison yet
     profiles: ["unity"]
 
   # The benchmark itself, as a container (or run the host binary).
@@ -163,11 +166,11 @@ networks:
 ```
 
 **Why LakeCat is built from source.** LakeCat depends on Sail as a Cargo *git*
-dependency on `querygraph/sail#lakecat` (fetched at build time) and on Grust as a
-local path dependency. `docker/build-lakecat.sh` compiles `lakecat-service` for
-Linux inside a Rust container with `~/src` mounted (so `../grust` resolves and Sail
-is fetched over the network), stages the ELF, and `docker compose build lakecat`
-packages it into the slim runtime image.
+dependency on `querygraph/sail#lakecat` (fetched at build time); Grust (0.11.0) and
+TypeSec are published crates. `docker/build-lakecat.sh` compiles `lakecat-service`
+for Linux inside a Rust container with `~/src` mounted (so `../lakecat` is the build
+root and Sail is fetched over the network), stages the ELF, and
+`docker compose build lakecat` packages it into the slim runtime image.
 
 ### 4. Build, deploy, and run — one command
 
@@ -227,10 +230,12 @@ catalog-commit-bench --base-url http://127.0.0.1:8185/api/catalog \
   --prefix bench --token "$TOKEN" $P
 ```
 
-### Unity Catalog (OSS)
-Bearer token, bare commit path. UC OSS has historically focused on Iceberg *reads*
-for external clients — confirm your build accepts external `updateTable` commits
-before trusting the write numbers.
+### Unity Catalog (OSS) — not yet supported on the commit path
+Released Unity OSS (0.5.0) serves its Iceberg REST endpoint **read-only**, so the
+commit benchmark has nothing to exercise. The commit handler lands only in unmerged
+draft PR [#1618](https://github.com/unitycatalog/unitycatalog/pull/1618) (unreleased
+0.6.0). Against a **write-capable build** of that branch the recipe would be a bearer
+token on the bare commit path:
 ```sh
 catalog-commit-bench --base-url http://127.0.0.1:8080/api/2.1/unity-catalog/iceberg \
   --prefix unity --token "$UC_TOKEN" $P
@@ -245,8 +250,10 @@ catalog-commit-bench --base-url http://127.0.0.1:8080/api/2.1/unity-catalog/iceb
   `POLARIS_CLIENT_ID`/`POLARIS_CLIENT_SECRET`, or pass a ready `POLARIS_TOKEN`.
 - **Gravitino** uses the `apache/gravitino-iceberg-rest` image; confirm your tag
   serves the REST API on the expected port (older tags differ).
-- **Unity (OSS)** verify it accepts external `updateTable` commits before trusting
-  write numbers.
+- **Unity (OSS)** released builds (≤ 0.5.0) serve Iceberg REST **read-only** — no
+  external `updateTable` commit handler exists, so it is left out of the comparison.
+  Commit support is in unmerged PR #1618 (unreleased 0.6.0); build from that branch
+  to include it.
 
 ## Fairness notes
 
@@ -274,12 +281,3 @@ catalog-commit-bench --base-url http://127.0.0.1:8080/api/2.1/unity-catalog/iceb
 | `--token` | Bearer token (`Authorization: Bearer ...`) |
 | `--iterations` / `--concurrency` / `--duration-secs` | Sequential count / concurrent writers / concurrent duration |
 | `--json` | Machine-readable summary |
-
-## Conformance note (LakeCat)
-
-Building this benchmark surfaced two Iceberg REST conformance gaps in LakeCat, both
-since fixed: it only accepted `updateTable` at `.../tables/{table}/commit` (now also
-accepts the bare `POST .../tables/{table}`), and `createTable` required a
-client-supplied metadata document (now also accepts a standard schema and generates
-the metadata server-side). `--commit-suffix` therefore exists only for catalogs that
-might still mount commit on a sub-path; LakeCat no longer needs it.

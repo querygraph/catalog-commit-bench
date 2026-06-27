@@ -1,9 +1,9 @@
 # Runtime image for lakecat-service.
 #
-# LakeCat's workspace has local path dependencies on ../sail (not published to
-# crates.io), so a self-contained in-container `cargo build` would need the
-# sibling repos in the build context. Instead we build the binary on the host
-# (where the siblings exist) via docker/build-lakecat.sh and package it here.
+# LakeCat depends on Sail as a Cargo *git* dependency (querygraph/sail#lakecat),
+# fetched at build time rather than published to crates.io, so we build the
+# binary for Linux via docker/build-lakecat.sh (which has network access to fetch
+# the git dep) and package the staged ELF here.
 FROM debian:bookworm-slim
 
 # libpython3.11 is required at runtime when the binary is built with the

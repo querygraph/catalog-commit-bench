@@ -57,13 +57,16 @@ services:
       GRAVITINO_ICEBERG_REST_CATALOG_BACKEND: memory
       GRAVITINO_ICEBERG_REST_CATALOG_WAREHOUSE: /tmp/gravitino-warehouse
 
-  # --- Unity Catalog OSS (best-effort; verify write support) --------------
-  # Unity OSS has historically focused on Iceberg READS for external clients.
-  # Confirm your build accepts external updateTable commits before trusting the
-  # write numbers.
+  # --- Unity Catalog OSS (read-only Iceberg REST; NOT in the comparison) ---
+  # Released Unity OSS (latest 0.5.0) exposes its Iceberg REST endpoint at
+  # /api/2.1/unity-catalog/iceberg as READ-ONLY: it has no external updateTable /
+  # set-properties commit path, so it cannot be benchmarked on the commit path.
+  # Write/commit support exists only in unmerged draft PR #1618 (targeting an
+  # unreleased 0.6.0); build from that branch to include Unity. Server is on 8080
+  # (UI on 3000); remap the host port here if 8080 is taken. See README / DOCKER.md.
   unitycatalog:
-    image: unitycatalog/unitycatalog:latest
-    ports: ["8080:8080"]
+    image: unitycatalog/unitycatalog:0.5.0
+    ports: ["8080:8080"]         # remap (e.g. 8087:8080) if host 8080 is taken
     profiles: ["unity"]
 
   # --- The benchmark itself -----------------------------------------------

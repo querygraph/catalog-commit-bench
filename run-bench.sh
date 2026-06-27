@@ -51,6 +51,9 @@ else
 fi
 
 # --- Unity Catalog -----------------------------------------------------------
+# NOTE: released Unity OSS (<= 0.5.0) serves Iceberg REST read-only, so --create
+# and the commit path will fail; this only works against a write-capable build
+# (PR #1618 / 0.6.0). Left here, gated on reachability, for when that ships.
 UNITY_BASE="${UNITY_BASE:-http://127.0.0.1:8080/api/2.1/unity-catalog/iceberg}"
 if reachable "$UNITY_BASE/v1/config"; then
   run_one "Unity" "$UNITY_BASE" --prefix "${UNITY_PREFIX:-unity}" \

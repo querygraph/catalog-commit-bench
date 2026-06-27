@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Build lakecat-service for Linux and stage the binary for the runtime image.
 #
-# As of LakeCat 0.2.0, Sail is consumed as a Cargo *git* dependency on the
-# querygraph/sail `lakecat` branch (public), so the build needs network access
-# to fetch it — not a ../sail path mount. Grust is still a local path dep, so we
-# build inside a Linux Rust container with ~/src mounted (../grust resolves
-# through the mount). TypeSec is the published crate. The output is a real Linux
-# ELF that runs in the slim runtime image. Reproducible and arch-correct.
+# As of LakeCat 0.2.1, the only external source dependency is Sail, consumed as a
+# Cargo *git* dependency on the querygraph/sail `lakecat` branch (public), so the
+# build needs network access to fetch it — not a ../sail path mount. Grust and
+# TypeSec are now published crates (Grust 0.11.0), so no sibling checkout is
+# required; we still build inside a Linux Rust container with ~/src mounted so
+# `../lakecat` is the build root and the output is a real Linux ELF for the slim
+# runtime image. Reproducible and arch-correct.
 #
 #   FEATURES=turso-local,sail-local docker/build-lakecat.sh
 #
@@ -17,10 +18,9 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 bench_repo="$(cd "$here/.." && pwd)"
-src_root="${SRC_ROOT:-$(cd "$bench_repo/.." && pwd)}"   # dir containing lakecat + grust (+ sail/typesec)
+src_root="${SRC_ROOT:-$(cd "$bench_repo/.." && pwd)}"   # dir containing lakecat (grust/sail/typesec come from registries)
 
 [[ -d "$src_root/lakecat" ]] || { echo "lakecat not found under $src_root (set SRC_ROOT)" >&2; exit 1; }
-[[ -d "$src_root/grust" ]]   || { echo "grust not found under $src_root (set SRC_ROOT)" >&2; exit 1; }
 
 target_dir="$bench_repo/.linux-target"
 mkdir -p "$target_dir"

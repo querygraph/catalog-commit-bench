@@ -6,32 +6,35 @@ every catalog writes to one bucket), see **[README.md](README.md) → "Docker se
 for impartial runs with MinIO"**. This file covers the LakeCat-from-source build
 and day-to-day operation.
 
-**LakeCat is fully wired and verified here.** Polaris, Gravitino, and Unity are
-included behind compose profiles with best-effort upstream images; each needs a
-bootstrap/auth step that is not hands-off (see *Bootstrap caveats*).
+**LakeCat is fully wired and verified here.** Polaris and Gravitino are included
+behind compose profiles with best-effort upstream images; each needs a
+bootstrap/auth step that is not hands-off (see *Bootstrap caveats*). Unity OSS has a
+profile too but is **not benchmarkable on the commit path** until its write
+endpoints ship (read-only until PR #1618 / 0.6.0 — see *Bootstrap caveats*).
 
 ## Layout assumption
 
-The harness lives in `~/src/catalog-commit-bench` alongside the sibling repos it
-needs to build LakeCat:
+The harness lives in `~/src/catalog-commit-bench` next to the one sibling repo it
+builds:
 
 ```
 ~/src/
   catalog-commit-bench/   <- this repo
   lakecat/                <- built from source
-  grust/                  <- LakeCat path dependency (resolved via the ~/src mount)
 ```
 
-Sail is **not** required as a local checkout: LakeCat depends on it as a Cargo
-**git** dependency on `querygraph/sail#lakecat`, fetched during the build. TypeSec
-is the published crate.
+As of LakeCat 0.2.1 the only sibling checkout needed is `lakecat` itself. Sail is
+a Cargo **git** dependency on `querygraph/sail#lakecat`, fetched during the build;
+Grust (0.11.0) and TypeSec are now **published crates**, so neither needs a local
+path checkout.
 
 ## Building LakeCat for Linux
 
-LakeCat's workspace mixes a git dependency (Sail) and a local path dependency
-(Grust), so we build `lakecat-service` for Linux inside a Rust container with
-`~/src` mounted — `../grust` resolves through the mount, Sail is fetched over the
-container's network, and the output is a real Linux ELF for the slim runtime image:
+LakeCat's only out-of-registry dependency is the Sail git dep, so we build
+`lakecat-service` for Linux inside a Rust container with `~/src` mounted (so
+`../lakecat` is the build root) — Sail is fetched over the container's network,
+Grust/TypeSec come from crates.io, and the output is a real Linux ELF for the slim
+runtime image:
 
 ```sh
 ./docker/build-lakecat.sh          # compile lakecat-service (Linux) and stage the binary
@@ -44,8 +47,9 @@ docker compose up -d lakecat       # run it on the shared network, pointed at Mi
   `FEATURES=turso-local,sail-local`; `sail-local` makes each commit write a real
   `metadata.json`) in a `rust:1-bookworm` container;
 - mounts `~/src` read-write at `/src`, plus two named volumes —
-  `catalog-bench-cargo-registry` (crates.io cache) and `catalog-bench-cargo-git`
-  (the querygraph/sail git checkout) — so rebuilds are incremental;
+  `catalog-bench-cargo-registry` (crates.io cache, incl. Grust/TypeSec) and
+  `catalog-bench-cargo-git` (the querygraph/sail git checkout) — so rebuilds are
+  incremental;
 - needs the container's default-bridge network to fetch the Sail git dep, and
   `protobuf-compiler` (installed in-container) for Sail/DataFusion;
 - writes output to `.linux-target/` and stages the binary at
@@ -102,12 +106,16 @@ docker compose --profile unity     up -d unitycatalog
 - **Gravitino** uses the `apache/gravitino-iceberg-rest` image with a memory
   backend. Confirm your tag serves the REST API on the expected port; older tags
   differ. Spec-conformant.
-- **Unity (OSS)** has historically focused on Iceberg *reads* for external clients;
-  verify it accepts external `updateTable` commits before trusting write numbers.
+- **Unity (OSS)** released builds (latest 0.5.0) serve Iceberg REST **read-only** —
+  there is no external `updateTable`/`set-properties` commit handler, so Unity is
+  *out of the comparison*, not merely un-bootstrapped. Commit support exists only in
+  unmerged draft PR #1618 (unreleased 0.6.0); build the image from that branch to
+  benchmark it. The `unity` compose profile is kept ready for when it lands.
 
-These three are scaffolded honestly: the service definitions and run-script hooks
-are correct, but their first-run bootstrap/auth is upstream-specific and must be
-completed before the commit numbers mean anything. LakeCat is the one path proven
+Polaris and Gravitino are scaffolded honestly: the service definitions and
+run-script hooks are correct, but their first-run bootstrap/auth is upstream-specific
+and must be completed before the commit numbers mean anything. Unity OSS is wired the
+same way but blocked upstream (read-only REST). LakeCat is the one path proven
 end-to-end in this harness.
 
 ## What it measures
