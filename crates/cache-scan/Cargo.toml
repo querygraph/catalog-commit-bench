@@ -3,7 +3,7 @@ name = "catalog-bench-cache-scan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cold-vs-warm scan benchmark (Sail + Foyer object-store cache) — SCAFFOLD."
+description = "Cold-vs-warm scan benchmark: Sail's Foyer object-store cache over MinIO/S3."
 
 [[bin]]
 name = "catalog-bench-cache-scan"
@@ -13,3 +13,17 @@ path = "src/main.rs"
 catalog-bench-common = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+futures = "0.3"
+
+# Sail's Foyer object-store cache, by PATH on the feat/object-store-foyer-cache
+# branch. `default-features = false` skips Sail's `hdfs` feature (not needed here).
+sail-object-store = { path = "../../../sail/crates/sail-object-store", default-features = false }
+
+# These MUST resolve to the exact same versions Sail's object-store layer uses,
+# so `CachingObjectStore`'s `Arc<dyn ObjectStore>` typechecks against our reader.
+# Pinned from ~/src/sail/Cargo.lock: object_store 0.13.2, parquet/arrow 58.3.0.
+object_store = { version = "0.13.2", features = ["aws"] }
+parquet = { version = "58.3.0", features = ["async", "object_store"] }
+arrow = { version = "58.3.0" }

@@ -46,8 +46,8 @@ const BENCHES: &[BenchSpec] = &[
     BenchSpec {
         name: "cache-scan",
         package: "catalog-bench-cache-scan",
-        status: BenchStatus::Scaffold,
-        description: "Cold vs warm scan via Sail + Foyer object-store cache (scaffold).",
+        status: BenchStatus::Ready,
+        description: "Cold vs warm Parquet scan via Sail's Foyer object-store cache (MinIO/S3).",
     },
     BenchSpec {
         name: "rust-vs-jvm",

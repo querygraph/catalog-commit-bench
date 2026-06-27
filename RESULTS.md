@@ -147,6 +147,57 @@ fixes, in order:
    commits = `database is locked`; first serialized via a per-store async mutex,
    then superseded by MVCC concurrent writes in 0.2.0.
 
+# cache-scan results — Sail's Foyer object-store cache (cold vs warm)
+
+A separate read-path benchmark (`catalog-bench run cache-scan`, status **Ready**)
+measures Sail's new Foyer object-store cache
+(`sail_object_store::CachingObjectStore`, branch `feat/object-store-foyer-cache`).
+It writes a Parquet dataset to MinIO once, then fully scans every file — decoding
+all row groups into Arrow `RecordBatch`es and counting rows + bytes — three ways:
+
+- **no-cache** — read through the raw `AmazonS3` store (no cache).
+- **cold** — wrap the raw store in a *fresh* `CachingObjectStore` (empty cache) and
+  read once: each page is fetched from MinIO and cached.
+- **warm** — read again through the *same*, now-populated cache: Foyer in-memory hits.
+
+The reader is the `parquet` async reader (`ParquetObjectReader` +
+`ParquetRecordBatchStreamBuilder`) over the object store directly, pinned to the
+exact `object_store 0.13.2` / `parquet`+`arrow 58.3.0` Sail's cache layer uses, so
+every byte routes through `CachingObjectStore`.
+
+**Dataset:** 16 Parquet files × 200,000 rows (id `i64`, two measures `i64`/`f64`, a
+low-cardinality `grp` string), ~5.4 MB/file, **86.9 MB / 3.2 M rows total**; default
+`CacheConfig` (1 MiB pages, 1 GiB memory, 64 MiB metadata).
+
+**Measured (live MinIO at `127.0.0.1:9000`, per-file p50/p95):**
+
+| phase | per-file p50 | per-file p95 | throughput |
+|---|---|---|---|
+| no-cache (raw S3) | **47.7 ms** | 49.8 ms | 113 MB/s · 4.2 M rows/s |
+| cold (fresh cache) | **47.5 ms** | 48.7 ms | 114 MB/s · 4.2 M rows/s |
+| warm (Foyer hits) | **1.81 ms** | 2.09 ms | 2960 MB/s · 109 M rows/s |
+
+**Speedup: warm is ~26× faster than cold and ~26× faster than no-cache** (warm
+p50 1.81 ms vs cold 47.5 ms). Cold ≈ no-cache (cold pays the MinIO fetch to fill
+the cache), confirming the win comes from cache hits, not the wrapper. The cache
+**engaged** — `warm ≪ cold` is the hit/miss signal (the layer exposes no public
+hit counter, so the latency collapse is the proof).
+
+**Caveat — local MinIO understates the win.** On loopback, per-request latency is
+sub-millisecond, so "cold" object reads are already cheap; the 26× warm speedup is
+a *lower bound*. Against remote S3 (tens of ms per request, multiplied across the
+many small range reads a Parquet scan issues for footers/row-group columns), the
+warm-vs-cold advantage is dramatically larger.
+
+Reproduce:
+
+```sh
+cd ~/src/catalog-bench
+cargo run -p catalog-bench-cache-scan --release       # direct
+cargo run -q -p catalog-bench -- run cache-scan --release   # via the driver
+# knobs: --files --rows --row-group --no-cache-iters --warm-iters --rewrite
+```
+
 ## Reproduce
 
 ```sh
