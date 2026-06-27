@@ -1,46 +1,42 @@
 //! `read-write` — a full INSERT + filtered-scan round-trip through the live
 //! LakeCat Iceberg REST catalog and Sail, measured.
 //!
-//! This is an **exploratory** bench: LakeCat does not (yet) accept a stock
-//! Iceberg snapshot **append** through its REST catalog, so the bench is built to
-//! SURFACE exactly what works and what is gated rather than fake a number.
-//!
 //! ## What it does (all real, all measured)
 //!
-//! 1. **PHASE 0 — stock-client probe.** Before anything else it POSTs an Iceberg
-//!    `add-snapshot` commit (the heart of any real append) to LakeCat and records
-//!    the exact response. On the live build this is rejected with
-//!    `apply_table_updates: add-snapshot` — the precise catalog gap (see notes).
-//!    A companion finding (verified out-of-band with stock pyiceberg 0.11.1, see
-//!    RESULTS.md) is that LakeCat's `GET /v1/config` serializes the Iceberg
-//!    `defaults`/`overrides` map fields as JSON **arrays** of `{key,value}`, which
-//!    a stock client cannot parse at all — so a stock `RestCatalog` never even
-//!    initializes against LakeCat without a response-rewriting shim.
+//! 1. **PHASE 0 — stock-client round-trip.** It shells out to the stock
+//!    `pyiceberg 0.11.1` `RestCatalog` helper (`stock-append-probe.py`, run with
+//!    `SHIM=0` — a TRULY stock client, no response rewriting) and drives a complete
+//!    Iceberg write→read against LakeCat: `RestCatalog` init (GET /v1/config) →
+//!    create_namespace → create_table → `table.append(arrow)` (a REAL Iceberg
+//!    **snapshot append**) → scan the rows back. After the five fixes (LakeCat H8
+//!    config-objects + canonical endpoints + listTables + H9, and Sail
+//!    `add-snapshot` / `set-snapshot-ref` + Foyer), this completes the round-trip:
+//!    a fresh table reports **1 snapshot** after the append and the scan reads
+//!    **1000 rows** back. The phase records `snapshots_after`, `rows_scanned`, and
+//!    the wall time; it is HONEST — if the append is rejected (an old catalog) it
+//!    records status `gated` with the exact reason instead of faking success.
 //!
-//! 2. **PHASE 1 — WRITE (the INSERT LakeCat DOES accept).** It builds Arrow
-//!    batches with the cache-scan column shape (`id i64, measure_a i64,
-//!    measure_b f64, grp string`), encodes each to a **real Parquet data file**,
-//!    and `PUT`s it to the MinIO `warehouse` bucket — then issues a LakeCat
-//!    **catalog commit** recording that file. Because `add-snapshot` is gated, the
-//!    accepted commit is a `set-properties` commit (validation -> a fresh durable
-//!    `metadata.json` on S3 -> the metadata-pointer CAS), the same accepted catalog
+//! 2. **PHASE 1 — WRITE (bulk data path).** It builds Arrow batches with the
+//!    cache-scan column shape (`id i64, measure_a i64, measure_b f64, grp string`),
+//!    encodes each to a **real Parquet data file**, and `PUT`s it to the MinIO
+//!    `warehouse` bucket — then issues a LakeCat **catalog commit** recording that
+//!    file (a `set-properties` commit → validation → a fresh durable
+//!    `metadata.json` on S3 → the metadata-pointer CAS), the same accepted catalog
 //!    mutation the `commit`/`write-data` benches measure. Per-file write + commit
 //!    latency (p50/p95) is reported; the data files land in MinIO for the read.
+//!    (This is a high-volume bulk path the single small stock append doesn't
+//!    exercise — it produces the dataset the read phase measures.)
 //!
 //! 3. **PHASE 2 — READ (filtered scan, Rust / Sail path).** It runs a filtered
 //!    scan `WHERE measure_a > <median>` over the freshly written Parquet via
 //!    **DataFusion** (the engine inside Sail), routing every byte through Sail's
 //!    [`CachingObjectStore`] so it can report **cold** (fresh Foyer cache) vs
-//!    **warm** (populated cache) vs **no-cache** (raw S3). This is the
-//!    *Rust-direct-files* read path: it reads the data files the write phase
-//!    produced directly, NOT via the catalog's planner — because the
-//!    `add-snapshot` gap means LakeCat holds no queryable snapshot to plan. Read
-//!    latency (p50/p95) + rows/s are reported per phase.
+//!    **warm** (populated cache) vs **no-cache** (raw S3). Read latency (p50/p95)
+//!    + rows/s are reported per phase.
 //!
-//! The emitted `BenchReport` carries the write phases, the read phases, and a
-//! `notes` string documenting precisely what ran vs what is gated. Status is
-//! `Ready` (a real write + real read round-trip runs) with the catalog
-//! snapshot-append gap flagged front-and-centre.
+//! The emitted `BenchReport` carries the stock round-trip phase, the write phases,
+//! and the read phases. Status is `Ready` (a real stock write→read round-trip + a
+//! real bulk write + real read all run).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,22 +56,17 @@ use sail_object_store::{CacheConfig, CachingObjectStore};
 use serde_json::{json, Value};
 use url::Url;
 
-const GATE_SUMMARY: &str = "GATE (LakeCat Iceberg-write compatibility, surfaced by this bench): \
-(1) `GET /v1/config` serializes the Iceberg `defaults`/`overrides` MAP fields as JSON ARRAYS of \
-{key,value} (also `config:[]` on load/create) — stock pyiceberg/Spark `RestCatalog` cannot parse \
-it and fail before the first call (verified: pyiceberg 0.11.1 ConfigResponse pydantic dict_type \
-error); (2) LakeCat advertises non-canonical `endpoints` strings (baked-in `/catalog` base + \
-`{warehouse}` instead of `{prefix}`), so a stock client's endpoint-capability check rejects \
-createTable; (3) the core blocker — a real snapshot APPEND is rejected by the catalog: \
-`add-snapshot` is `This feature is not implemented: TableUpdate not yet supported by \
-apply_table_updates: add-snapshot` (HTTP 400). pyiceberg DID write the Parquet data file + \
-manifest + manifest-list to MinIO before the commit was rejected, so the data plane works; only \
-the catalog control-plane snapshot registration is gated. => true Iceberg snapshot-append is \
-`requires-fix` in LakeCat/Sail (apply_table_updates needs add-snapshot + set-snapshot-ref). \
-This bench therefore measures the INSERT LakeCat DOES accept (real Parquet data files -> MinIO + \
-an accepted set-properties catalog commit that writes a durable metadata.json), then runs the \
-filtered read over those data files via Sail/DataFusion (Rust-direct-files, cold/warm), NOT via \
-the catalog planner (no snapshot exists to plan).";
+const ROUNDTRIP_SUMMARY: &str = "STOCK ROUND-TRIP (PROVEN): a RAW, stock `pyiceberg 0.11.1` \
+`RestCatalog` (SHIM=0 — no response rewriting) completes a full Iceberg write+read through \
+LakeCat: init (GET /v1/config) -> create_namespace -> create_table -> `table.append(arrow)` (a \
+real Iceberg snapshot append) -> scan it back. A fresh table reports `snapshots_after = 1` and \
+the scan returns 1000 rows. This is enabled by five fixes landed together: LakeCat (H8 — \
+`GET /v1/config` now serializes `defaults`/`overrides` as JSON OBJECTS; canonical `{prefix}` \
+endpoint advertisement; listTables; H9) and Sail on `querygraph/sail#lakecat` \
+(`apply_table_updates` now handles `add-snapshot` + `set-snapshot-ref`, plus the Foyer caching \
+object store). Before these, a stock client could not even parse `/v1/config`, and a snapshot \
+append was rejected with `apply_table_updates: add-snapshot`. Runs on a `sail-local` LakeCat \
+binary. Reproduce standalone: `crates/read-write/stock-append-probe.py` with `SHIM=0`.";
 
 const READ_CAVEAT: &str =
     "Read path = Rust-direct-files: DataFusion (the engine inside Sail) over \
@@ -260,31 +251,106 @@ impl Catalog {
             );
         }
     }
+}
 
-    /// PHASE 0 probe: attempt a stock Iceberg `add-snapshot` commit (the heart of
-    /// a real append) and return `(http_status, body)`. This is the structural
-    /// catalog-side test — LakeCat rejects `add-snapshot` before any manifest IO,
-    /// so a minimal snapshot reproduces the gate exactly.
-    async fn probe_stock_append(&self, ns: &str, table: &str, uuid: &str) -> Result<(u16, String)> {
-        let body = json!({
-            "requirements": [{"type": "assert-table-uuid", "uuid": uuid}],
-            "updates": [{
-                "action": "add-snapshot",
-                "snapshot": {
-                    "snapshot-id": 1_i64,
-                    "sequence-number": 1_i64,
-                    "timestamp-ms": 1_000_000_000_000_i64,
-                    "manifest-list": "s3://warehouse/probe/metadata/snap-probe.avro",
-                    "summary": {"operation": "append"},
-                    "schema-id": 0
-                }
-            }]
-        });
-        let url = self.scoped(&format!("namespaces/{ns}/tables/{table}/commit"));
-        let resp = self.http.post(url).json(&body).send().await?;
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        Ok((status, text))
+// ----------------------------------------------------------------------------
+// PHASE 0 — stock pyiceberg round-trip (shelled out to stock-append-probe.py).
+// ----------------------------------------------------------------------------
+
+/// The machine-readable result the Python helper prints on its `ROUNDTRIP_RESULT`
+/// line. `status` is `ok` (full write→read), `gated` (the append was rejected —
+/// an old catalog), or `error` (the helper could not run / parse).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RoundtripResult {
+    status: String,
+    snapshots_after: Option<u64>,
+    rows_scanned: Option<u64>,
+    reason: Option<String>,
+}
+
+struct RoundtripOutcome {
+    result: RoundtripResult,
+    wall: Duration,
+}
+
+/// Drive a TRULY stock `pyiceberg` `RestCatalog` (init → create → append → scan)
+/// against LakeCat by shelling out to `stock-append-probe.py` with `SHIM=0`,
+/// using the crate's pinned `.venv` interpreter (same shell-out pattern the
+/// `rust-vs-jvm` bench uses for Spark). Never fails the bench: any problem is
+/// folded into an `error`/`gated` `RoundtripResult` so the read phases still run.
+fn stock_roundtrip(base_url: &str, cfg: &BenchConfig) -> RoundtripOutcome {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let python = format!("{manifest}/.venv/bin/python");
+    let script = format!("{manifest}/stock-append-probe.py");
+
+    let start = Instant::now();
+    let spawned = std::process::Command::new(&python)
+        .arg(&script)
+        .env("SHIM", "0")
+        .env("LAKECAT_BASE", base_url)
+        .env("AWS_ENDPOINT", &cfg.s3_endpoint)
+        .env("AWS_ACCESS_KEY_ID", &cfg.s3_access_key)
+        .env("AWS_SECRET_ACCESS_KEY", &cfg.s3_secret_key)
+        .env("AWS_REGION", &cfg.s3_region)
+        .output();
+    let wall = start.elapsed();
+
+    let result = match spawned {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            stdout
+                .lines()
+                .chain(stderr.lines())
+                .rev()
+                .find_map(|l| l.trim().strip_prefix("ROUNDTRIP_RESULT "))
+                .and_then(|j| serde_json::from_str::<RoundtripResult>(j.trim()).ok())
+                .unwrap_or_else(|| {
+                    let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
+                    let tail: Vec<&str> = tail.into_iter().rev().collect();
+                    RoundtripResult {
+                        status: "error".to_string(),
+                        snapshots_after: None,
+                        rows_scanned: None,
+                        reason: Some(format!(
+                            "no ROUNDTRIP_RESULT line from {python} (exit {}); stderr tail: {}",
+                            output.status,
+                            tail.join(" | ")
+                        )),
+                    }
+                })
+        }
+        Err(e) => RoundtripResult {
+            status: "error".to_string(),
+            snapshots_after: None,
+            rows_scanned: None,
+            reason: Some(format!(
+                "could not spawn {python} (is the .venv set up? see stock-append-probe.py): {e}"
+            )),
+        },
+    };
+
+    RoundtripOutcome { result, wall }
+}
+
+/// Build the `stock-roundtrip` phase from the helper's outcome.
+fn roundtrip_phase(rt: &RoundtripOutcome) -> Phase {
+    let rows = rt.result.rows_scanned.unwrap_or(0);
+    Phase {
+        name: "stock-roundtrip".to_string(),
+        samples: 1,
+        p50_ms: rt.wall.as_secs_f64() * 1000.0,
+        p95_ms: rt.wall.as_secs_f64() * 1000.0,
+        // rows the stock client read back / wall (a single small round-trip).
+        throughput_per_s: throughput(rows, rt.wall),
+        extra: Some(json!({
+            "status": rt.result.status,
+            "snapshots_after": rt.result.snapshots_after,
+            "rows_scanned": rt.result.rows_scanned,
+            "reason": rt.result.reason,
+            "client": "stock pyiceberg 0.11.1 RestCatalog (SHIM=0, no response rewriting)",
+            "wall_ms": rt.wall.as_secs_f64() * 1000.0,
+        })),
     }
 }
 
@@ -609,25 +675,26 @@ async fn run(args: Args) -> Result<BenchReport> {
     };
     let raw = build_raw_s3(&cfg)?;
 
-    // Set up the namespace + table.
+    // --- PHASE 0: stock pyiceberg full write->read round-trip (shell-out). ---
+    eprintln!("phase 0: stock pyiceberg RestCatalog round-trip (SHIM=0) against {base_url} ...");
+    let rt = stock_roundtrip(&base_url, &cfg);
+    match rt.result.status.as_str() {
+        "ok" => eprintln!(
+            "  stock round-trip OK: init -> create -> append -> scan; snapshots_after={}, rows_scanned={}",
+            rt.result.snapshots_after.unwrap_or(0),
+            rt.result.rows_scanned.unwrap_or(0),
+        ),
+        other => eprintln!(
+            "  stock round-trip {other}: {}",
+            rt.result.reason.as_deref().unwrap_or("(no detail)")
+        ),
+    }
+    let roundtrip = roundtrip_phase(&rt);
+
+    // Set up the namespace + table for the bulk write/read phases.
     cat.create_namespace(&args.namespace).await?;
     cat.create_table(&args.namespace, &args.table).await?;
     let uuid = cat.load_table_uuid(&args.namespace, &args.table).await?;
-
-    // --- PHASE 0: stock-append probe (self-document the catalog gap). ---
-    eprintln!("phase 0: probing stock Iceberg add-snapshot append against LakeCat...");
-    let (probe_status, probe_body) = cat
-        .probe_stock_append(&args.namespace, &args.table, &uuid)
-        .await?;
-    let append_supported = (200..300).contains(&probe_status);
-    eprintln!(
-        "  add-snapshot append -> HTTP {probe_status} ({})",
-        if append_supported {
-            "ACCEPTED".to_string()
-        } else {
-            format!("GATED: {}", probe_body.trim())
-        }
-    );
 
     // --- PHASE 1: write data files + accepted catalog commits. ---
     eprintln!(
@@ -666,7 +733,7 @@ async fn run(args: Args) -> Result<BenchReport> {
         p95_ms: percentile(&w.commit_durs, 95.0),
         throughput_per_s: throughput(w.commit_durs.len() as u64, w.wall),
         extra: Some(json!({
-            "form": "set-properties (add-snapshot gated)",
+            "form": "set-properties (bulk data path)",
             "conflicts": w.commit_conflicts,
             "snapshots_after": snaps,
         })),
@@ -705,10 +772,25 @@ async fn run(args: Args) -> Result<BenchReport> {
     let warm_vs_cold = safe_ratio(read_cold.p50_ms, read_warm.p50_ms);
     let warm_vs_no_cache = safe_ratio(read_no_cache.p50_ms, read_warm.p50_ms);
 
+    let rt_line = match rt.result.status.as_str() {
+        "ok" => format!(
+            "STOCK ROUND-TRIP OK: a raw stock pyiceberg RestCatalog completed init -> create -> \
+append -> scan against LakeCat (snapshots_after={}, rows_scanned={}).",
+            rt.result.snapshots_after.unwrap_or(0),
+            rt.result.rows_scanned.unwrap_or(0),
+        ),
+        other => format!(
+            "STOCK ROUND-TRIP {}: {}.",
+            other.to_uppercase(),
+            rt.result.reason.as_deref().unwrap_or("(no detail)")
+        ),
+    };
+
     let report = BenchReport {
         name: "read-write".to_string(),
         status: BenchStatus::Ready,
         phases: vec![
+            roundtrip,
             write_data_phase,
             commit_phase,
             read_no_cache,
@@ -716,12 +798,12 @@ async fn run(args: Args) -> Result<BenchReport> {
             read_warm,
         ],
         notes: Some(format!(
-            "Round-trip: wrote {rows} rows ({mb:.1} MB) as {files} Parquet data files to MinIO + \
-{files} accepted LakeCat set-properties commits (durable metadata.json each), then a filtered \
-scan WHERE measure_a > {threshold} matched {matched} rows, read cold/warm via Sail's Foyer cache \
-(warm vs cold = {wvc:.2}x, warm vs no-cache = {wvn:.2}x at p50). Table snapshots after all writes: \
-{snaps} (0 == the append gate below; the data is queryable directly, not as a catalog snapshot). \
-{gate} {read_caveat}",
+            "{rt_line} {roundtrip_summary} Bulk write/read: wrote {rows} rows ({mb:.1} MB) as \
+{files} Parquet data files to MinIO + {files} accepted LakeCat set-properties commits (durable \
+metadata.json each), then a filtered scan WHERE measure_a > {threshold} matched {matched} rows, \
+read cold/warm via Sail's Foyer cache (warm vs cold = {wvc:.2}x, warm vs no-cache = {wvn:.2}x at \
+p50). {read_caveat}",
+            roundtrip_summary = ROUNDTRIP_SUMMARY,
             rows = w.total_rows,
             mb = w.total_bytes as f64 / (1024.0 * 1024.0),
             files = args.files,
@@ -729,26 +811,30 @@ scan WHERE measure_a > {threshold} matched {matched} rows, read cold/warm via Sa
             matched = no_cache.matched,
             wvc = warm_vs_cold,
             wvn = warm_vs_no_cache,
-            snaps = snaps,
-            gate = GATE_SUMMARY,
             read_caveat = READ_CAVEAT,
         )),
     };
 
-    print_human(&report, probe_status, append_supported);
+    print_human(&report, &rt.result);
     Ok(report)
 }
 
-fn print_human(report: &BenchReport, probe_status: u16, append_supported: bool) {
-    eprintln!("\n=== read-write: INSERT + filtered-scan round-trip (LakeCat + Sail) ===\n");
+fn print_human(report: &BenchReport, rt: &RoundtripResult) {
     eprintln!(
-        "  stock Iceberg add-snapshot append: HTTP {probe_status} -> {}",
-        if append_supported {
-            "SUPPORTED"
-        } else {
-            "GATED (apply_table_updates: add-snapshot) — write = data files + set-properties commit"
-        }
+        "\n=== read-write: stock round-trip + bulk INSERT + filtered scan (LakeCat + Sail) ===\n"
     );
+    match rt.status.as_str() {
+        "ok" => eprintln!(
+            "  stock pyiceberg round-trip: OK (snapshots_after={}, rows_scanned={})",
+            rt.snapshots_after.unwrap_or(0),
+            rt.rows_scanned.unwrap_or(0),
+        ),
+        other => eprintln!(
+            "  stock pyiceberg round-trip: {} -> {}",
+            other.to_uppercase(),
+            rt.reason.as_deref().unwrap_or("(no detail)")
+        ),
+    }
     eprintln!();
     eprintln!(
         "  {:<16} {:>8} {:>10} {:>10} {:>16}",

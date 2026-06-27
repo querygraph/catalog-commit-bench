@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Stock-client (pyiceberg) probe of LakeCat's Iceberg-write compatibility.
+"""Stock-client (pyiceberg) probe of LakeCat's Iceberg-write round-trip.
 
-This reproduces the PHASE 0 findings the `read-write` bench summarizes. It is a
-*diagnostic*, not part of the measured bench (the Rust bench self-documents the
-catalog gap via raw REST). Run it to see, end to end, exactly where a stock
-Iceberg `RestCatalog` write breaks against LakeCat.
+This is BOTH a standalone diagnostic AND the helper the `read-write` bench shells
+out to for its `stock-roundtrip` phase. It drives a RAW, stock `pyiceberg 0.11.1`
+`RestCatalog` against LakeCat end to end: init (GET /v1/config) → create_namespace
+→ create_table → `table.append(arrow)` (a REAL Iceberg snapshot append) → scan the
+rows back.
 
 Setup (kept out of git via .gitignore):
     cd crates/read-write
@@ -12,21 +13,25 @@ Setup (kept out of git via .gitignore):
     .venv/bin/pip install "pyiceberg[pyarrow,s3fs]"
     .venv/bin/python stock-append-probe.py
 
-What it shows, in order:
-  1. WITHOUT a shim, `RestCatalog(...)` raises a pydantic `dict_type` error
-     because LakeCat's GET /v1/config returns the `defaults`/`overrides` MAP
-     fields as JSON ARRAYS of {key,value}. (set SHIM=0 to see this raw failure.)
-  2. WITH the response-rewriting shim (default): the config + endpoints are
-     normalized so pyiceberg initializes; create_namespace + create_table
-     succeed; but `table.append(arrow)` is rejected by LakeCat with
-     `apply_table_updates: add-snapshot` — and the Parquet data file + manifest +
-     manifest-list have ALREADY been written to MinIO (the data plane works; only
-     the catalog snapshot registration is gated).
+Env knobs: LAKECAT_BASE (e.g. http://127.0.0.1:8183/catalog), AWS_ENDPOINT,
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, SHIM (default 1).
+
+`SHIM=0` runs a TRULY stock client (no response rewriting). After the five fixes
+(LakeCat H8 config-objects + canonical endpoints + listTables + H9, and Sail
+add-snapshot / set-snapshot-ref) this completes the full round-trip with
+`SHIM=0`. The legacy `SHIM=1` response-rewriting shim is retained only to
+reproduce the OLD pre-fix failure modes for comparison.
+
+Machine-readable output: the last line is always
+    ROUNDTRIP_RESULT {json}
+with `status` one of `ok` / `gated` / `error`, plus `snapshots_after`,
+`rows_scanned`, and `reason`. The Rust bench scrapes this line.
 """
 
 import json
 import os
 import sys
+import time
 import traceback
 
 import pyarrow as pa
@@ -85,6 +90,17 @@ if SHIM:
     requests.adapters.HTTPAdapter.send = _patched_send
 
 
+def emit(status, snapshots_after=None, rows_scanned=None, reason=None):
+    """Print the machine-readable result line the Rust bench scrapes."""
+    payload = {
+        "status": status,
+        "snapshots_after": snapshots_after,
+        "rows_scanned": rows_scanned,
+        "reason": reason,
+    }
+    print(f"ROUNDTRIP_RESULT {json.dumps(payload)}")
+
+
 def main() -> int:
     from pyiceberg.catalog.rest import RestCatalog
     from pyiceberg.schema import Schema
@@ -104,14 +120,18 @@ def main() -> int:
         cat = RestCatalog("lakecat", **props)
         print("    OK")
     except Exception as e:  # noqa: BLE001
-        print(f"    FAIL: {type(e).__name__}: {str(e)[:200]}")
+        reason = f"RestCatalog init failed: {type(e).__name__}: {str(e)[:200]}"
+        print(f"    FAIL: {reason}")
         if not SHIM:
             print(
-                "    ^ this is the raw config-array break; re-run with SHIM=1 to get past it."
+                "    ^ raw config-array break (pre-H8-fix); re-run with SHIM=1 to get past it."
             )
+        emit("gated", reason=reason)
         return 1
 
-    ns, tbl = "rw_pyi_probe", "events"
+    # Unique table per run so the append round-trip is reliably re-runnable
+    # (a fresh, empty table → snapshots after append is deterministically 1).
+    ns, tbl = "rw_pyi_probe", f"events_{int(time.time() * 1000)}"
     try:
         cat.create_namespace(ns)
     except Exception as e:  # noqa: BLE001
@@ -129,8 +149,16 @@ def main() -> int:
     except Exception:  # noqa: BLE001
         pass
     print("=== 2. create_table ===")
-    t = cat.create_table(ident, schema=schema, location=f"s3://warehouse/{ns}/events")
-    print(f"    OK; metadata_location={t.metadata_location}")
+    try:
+        t = cat.create_table(
+            ident, schema=schema, location=f"s3://warehouse/{ns}/{tbl}"
+        )
+        print(f"    OK; metadata_location={t.metadata_location}")
+    except Exception as e:  # noqa: BLE001
+        reason = f"create_table failed: {type(e).__name__}: {str(e)[:200]}"
+        print(f"    FAIL: {reason}")
+        emit("gated", reason=reason)
+        return 1
 
     n = 1000
     arr = pa.table(
@@ -145,21 +173,27 @@ def main() -> int:
     try:
         t.append(arr)
         t2 = cat.load_table(ident)
-        print(f"    OK; snapshots after append: {len(t2.metadata.snapshots)}")
-        print(f"    scan row count: {t2.scan().to_arrow().num_rows}")
+        snaps = len(t2.metadata.snapshots)
+        rows = t2.scan().to_arrow().num_rows
+        print(f"    OK; snapshots after append: {snaps}")
+        print(f"    scan row count: {rows}")
+        emit("ok", snapshots_after=snaps, rows_scanned=rows)
         return 0
     except Exception as e:  # noqa: BLE001
-        print(f"    GATED: {type(e).__name__}: {str(e)[:300]}")
+        reason = f"{type(e).__name__}: {str(e)[:300]}"
+        print(f"    GATED: {reason}")
         print(
-            "    ^ the data file + manifest + manifest-list ARE in MinIO; only the\n"
-            "      catalog snapshot-registration commit (add-snapshot) was rejected."
+            "    ^ append rejected by the catalog (old build?). The data file + manifest\n"
+            "      + manifest-list may already be in MinIO; only the snapshot commit failed."
         )
+        emit("gated", reason=reason)
         return 2
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         traceback.print_exc()
+        emit("error", reason=f"{type(e).__name__}: {str(e)[:200]}")
         sys.exit(3)
